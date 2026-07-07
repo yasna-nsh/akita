@@ -47,6 +47,8 @@ type AddressTranslator struct {
 	isWaitingOnGL0InvalidateRsp    bool
 	currentGL0InvReq               *mem.GL0InvalidateReq
 	totalRequestsUponGL0InvArrival int
+
+	remainingAccesses map[uint64]int
 }
 
 // SetTranslationProvider sets the remote port that can translate addresses.
@@ -138,14 +140,25 @@ func (t *AddressTranslator) translate(now sim.VTimeInSec) bool {
 	vAddr := req.GetAddress()
 	vPageID := t.addrToPageID(vAddr)
 
-	transReq := vm.TranslationReqBuilder{}.
+	transReqBuilder := vm.TranslationReqBuilder{}.
 		WithSendTime(now).
 		WithSrc(t.translationPort).
 		WithDst(t.translationProvider).
 		WithPID(req.GetPID()).
 		WithVAddr(vPageID).
-		WithDeviceID(t.deviceID).
-		Build()
+		WithDeviceID(t.deviceID)
+
+	if remaining, tracked := t.remainingAccesses[vPageID]; tracked {
+		remaining--
+		if remaining <= 0 {
+			delete(t.remainingAccesses, vPageID)
+			transReqBuilder = transReqBuilder.WithMigrate(true)
+		} else {
+			t.remainingAccesses[vPageID] = remaining
+		}
+	}
+
+	transReq := transReqBuilder.Build()
 	err := t.translationPort.Send(transReq)
 	if err != nil {
 		return false
@@ -192,6 +205,17 @@ func (t *AddressTranslator) parseTranslation(now sim.VTimeInSec) bool {
 	if transaction == nil {
 		t.translationPort.Retrieve(now)
 		return true
+	}
+
+	// start counting down if policy for page is access counter
+	// and haven't started count down before
+	page := transRsp.Page
+	if page.DeviceID != t.deviceID &&
+		page.MigrationPolicy == vm.PolicyAccessCounter {
+		_, exists := t.remainingAccesses[page.VAddr]
+		if !exists {
+			t.remainingAccesses[page.VAddr] = vm.MigrationThreshold
+		}
 	}
 
 	transaction.translationRsp = transRsp

@@ -41,7 +41,6 @@ type MMU struct {
 	PageAccessedByDeviceID map[uint64][]uint64
 
 	migrationPolicy vm.MigrationPolicy
-	accessThreshold int
 	useOASIS        bool
 }
 
@@ -137,13 +136,12 @@ func (mmu *MMU) pageNeedMigrate(walking transaction) bool {
 		return false
 	}
 
-	log.Printf("[req migrate] DID=%v, Vaddr=%v\n", walking.req.DeviceID, page.VAddr)
 	switch page.MigrationPolicy {
 	case vm.PolicyOnTouch:
 		return true
 
 	case vm.PolicyAccessCounter:
-		return mmu.checkAccessCounter(page, walking.req.DeviceID)
+		return mmu.checkAccessCounter(walking.req)
 
 	case vm.PolicyDuplication:
 		return mmu.checkDuplication(walking)
@@ -153,8 +151,9 @@ func (mmu *MMU) pageNeedMigrate(walking transaction) bool {
 	}
 }
 
-func (mmu *MMU) checkAccessCounter(page vm.Page, reqDevice uint64) bool {
-	return true
+func (mmu *MMU) checkAccessCounter(req *vm.TranslationReq) bool {
+	log.Printf("[access counter] vaddr=%v migrate=%v\n", req.VAddr, req.Migrate)
+	return req.Migrate // migrate page if gpu requested to
 }
 
 func (mmu *MMU) checkDuplication(walking transaction) bool {

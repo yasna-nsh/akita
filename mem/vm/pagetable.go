@@ -11,6 +11,8 @@ type PID uint32
 // Per-page migration policy
 type MigrationPolicy int
 
+const MigrationThreshold = 0
+
 const (
 	PolicyOnTouch MigrationPolicy = iota
 	PolicyAccessCounter
@@ -30,8 +32,7 @@ type Page struct {
 	IsMigrating bool
 	IsPinned    bool
 
-	MigrationPolicy    MigrationPolicy
-	MigrationThreshold int // for PolicyAccessCounter
+	MigrationPolicy MigrationPolicy
 }
 
 // A PageTable holds the a list of pages.

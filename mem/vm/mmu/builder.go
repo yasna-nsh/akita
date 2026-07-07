@@ -16,7 +16,6 @@ type Builder struct {
 	pageWalkingLatency       int
 
 	migrationPolicy vm.MigrationPolicy
-	accessThreshold int
 	useOASIS        bool
 }
 
@@ -79,11 +78,6 @@ func (b Builder) WithPageMigrationPolicy(policy vm.MigrationPolicy) Builder {
 	return b
 }
 
-func (b Builder) WithAccessThreshold(threshold int) Builder {
-	b.accessThreshold = threshold
-	return b
-}
-
 func (b Builder) WithOASIS(oasis bool) Builder {
 	b.useOASIS = oasis
 	return b
@@ -99,7 +93,6 @@ func (b Builder) Build(name string) *MMU {
 	b.createPageTable(mmu)
 	b.configureInternalStates(mmu)
 	mmu.migrationPolicy = b.migrationPolicy
-	mmu.accessThreshold = b.accessThreshold
 	mmu.useOASIS = b.useOASIS
 
 	return mmu

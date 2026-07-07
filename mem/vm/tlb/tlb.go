@@ -123,6 +123,15 @@ func (tlb *TLB) handleTranslationHit(
 	setID, wayID int,
 	page vm.Page,
 ) bool {
+	// let request through TLBs to MMU if migration is forced (for access counter)
+	if req.Migrate {
+		fetched := tlb.fetchBottom(now, req, false)
+		// log.Printf("Request hit TLB %v, but passing migration to MMU\n", tlb.Name())
+		if !fetched {
+			return false
+		}
+	}
+
 	ok := tlb.sendRspToTop(now, req, page)
 	if !ok {
 		return false
@@ -146,7 +155,7 @@ func (tlb *TLB) handleTranslationMiss(
 		return false
 	}
 
-	fetched := tlb.fetchBottom(now, req)
+	fetched := tlb.fetchBottom(now, req, true)
 	if fetched {
 		tlb.topPort.Retrieve(now)
 		tracing.TraceReqReceive(req, tlb)
@@ -193,7 +202,7 @@ func (tlb *TLB) processTLBMSHRHit(
 	return true
 }
 
-func (tlb *TLB) fetchBottom(now sim.VTimeInSec, req *vm.TranslationReq) bool {
+func (tlb *TLB) fetchBottom(now sim.VTimeInSec, req *vm.TranslationReq, mshr bool) bool {
 	fetchBottom := vm.TranslationReqBuilder{}.
 		WithSendTime(now).
 		WithSrc(tlb.bottomPort).
@@ -201,16 +210,17 @@ func (tlb *TLB) fetchBottom(now sim.VTimeInSec, req *vm.TranslationReq) bool {
 		WithPID(req.PID).
 		WithVAddr(req.VAddr).
 		WithDeviceID(req.DeviceID).
+		WithMigrate(req.Migrate).
 		Build()
 	err := tlb.bottomPort.Send(fetchBottom)
 	if err != nil {
 		return false
 	}
-
-	mshrEntry := tlb.mshr.Add(req.PID, req.VAddr)
-	mshrEntry.Requests = append(mshrEntry.Requests, req)
-	mshrEntry.reqToBottom = fetchBottom
-
+	if mshr {
+		mshrEntry := tlb.mshr.Add(req.PID, req.VAddr)
+		mshrEntry.Requests = append(mshrEntry.Requests, req)
+		mshrEntry.reqToBottom = fetchBottom
+	}
 	tracing.TraceReqInitiate(fetchBottom, tlb,
 		tracing.MsgIDAtReceiver(req, tlb))
 

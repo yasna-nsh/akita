@@ -91,6 +91,7 @@ func (b Builder) Build(name string) *AddressTranslator {
 	t.numReqPerCycle = b.numReqPerCycle
 	t.log2PageSize = b.log2PageSize
 	t.deviceID = b.deviceID
+	t.remainingAccesses = make(map[uint64]int)
 
 	return t
 }
