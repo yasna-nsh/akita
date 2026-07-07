@@ -39,6 +39,10 @@ type MMU struct {
 
 	toRemoveFromPTW        []int
 	PageAccessedByDeviceID map[uint64][]uint64
+
+	migrationPolicy vm.MigrationPolicy
+	accessThreshold int
+	useOASIS        bool
 }
 
 // Tick defines how the MMU update state each cycle
@@ -119,18 +123,41 @@ func (mmu *MMU) addTransactionToMigrationQueue(walkingIndex int) bool {
 }
 
 func (mmu *MMU) pageNeedMigrate(walking transaction) bool {
-	if walking.req.DeviceID == walking.page.DeviceID {
+	page := walking.page
+
+	if walking.req.DeviceID == page.DeviceID {
 		return false
 	}
 
-	if !walking.page.Unified {
+	if !page.Unified {
 		return false
 	}
 
-	if walking.page.IsPinned {
+	if page.IsPinned {
 		return false
 	}
 
+	log.Printf("[req migrate] DID=%v, Vaddr=%v\n", walking.req.DeviceID, page.VAddr)
+	switch page.MigrationPolicy {
+	case vm.PolicyOnTouch:
+		return true
+
+	case vm.PolicyAccessCounter:
+		return mmu.checkAccessCounter(page, walking.req.DeviceID)
+
+	case vm.PolicyDuplication:
+		return mmu.checkDuplication(walking)
+
+	default:
+		return true // unset/zero value = on-touch, safe fallback
+	}
+}
+
+func (mmu *MMU) checkAccessCounter(page vm.Page, reqDevice uint64) bool {
+	return true
+}
+
+func (mmu *MMU) checkDuplication(walking transaction) bool {
 	return true
 }
 
@@ -286,7 +313,7 @@ func (mmu *MMU) processMigrationReturn(now sim.VTimeInSec) bool {
 	mmu.isDoingMigration = false
 
 	page = mmu.markPageAsNotMigratingIfNotInTheMigrationQueue(page)
-	page.IsPinned = true
+	// page.IsPinned = true
 	mmu.pageTable.Update(page)
 
 	mmu.migrationPort.Retrieve(now)

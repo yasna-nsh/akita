@@ -8,6 +8,15 @@ import (
 // PID stands for Process ID.
 type PID uint32
 
+// Per-page migration policy
+type MigrationPolicy int
+
+const (
+	PolicyOnTouch MigrationPolicy = iota
+	PolicyAccessCounter
+	PolicyDuplication
+)
+
 // A Page is an entry in the page table, maintaining the information about how
 // to translate a virtual address to a physical address.
 type Page struct {
@@ -20,6 +29,9 @@ type Page struct {
 	Unified     bool
 	IsMigrating bool
 	IsPinned    bool
+
+	MigrationPolicy    MigrationPolicy
+	MigrationThreshold int // for PolicyAccessCounter
 }
 
 // A PageTable holds the a list of pages.

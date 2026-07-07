@@ -14,6 +14,10 @@ type Builder struct {
 	migrationServiceProvider sim.Port
 	maxNumReqInFlight        int
 	pageWalkingLatency       int
+
+	migrationPolicy vm.MigrationPolicy
+	accessThreshold int
+	useOASIS        bool
 }
 
 // MakeBuilder creates a new builder
@@ -70,6 +74,21 @@ func (b Builder) WithPageWalkingLatency(n int) Builder {
 	return b
 }
 
+func (b Builder) WithPageMigrationPolicy(policy vm.MigrationPolicy) Builder {
+	b.migrationPolicy = policy
+	return b
+}
+
+func (b Builder) WithAccessThreshold(threshold int) Builder {
+	b.accessThreshold = threshold
+	return b
+}
+
+func (b Builder) WithOASIS(oasis bool) Builder {
+	b.useOASIS = oasis
+	return b
+}
+
 // Build returns a newly created MMU component
 func (b Builder) Build(name string) *MMU {
 	mmu := new(MMU)
@@ -79,6 +98,9 @@ func (b Builder) Build(name string) *MMU {
 	b.createPorts(name, mmu)
 	b.createPageTable(mmu)
 	b.configureInternalStates(mmu)
+	mmu.migrationPolicy = b.migrationPolicy
+	mmu.accessThreshold = b.accessThreshold
+	mmu.useOASIS = b.useOASIS
 
 	return mmu
 }

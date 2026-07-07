@@ -11,6 +11,7 @@ type TranslationReq struct {
 	VAddr    uint64
 	PID      PID
 	DeviceID uint64
+	Migrate  bool // modify this based on policy and access counter
 }
 
 // Meta returns the meta data associated with the message.
@@ -25,6 +26,7 @@ type TranslationReqBuilder struct {
 	vAddr    uint64
 	pid      PID
 	deviceID uint64
+	migrate  bool
 }
 
 // WithSendTime sets the send time of the request to build.:w
@@ -65,6 +67,11 @@ func (b TranslationReqBuilder) WithDeviceID(deviceID uint64) TranslationReqBuild
 	return b
 }
 
+func (b TranslationReqBuilder) WithMigrate(migrate bool) TranslationReqBuilder {
+	b.migrate = migrate
+	return b
+}
+
 // Build creates a new TranslationReq
 func (b TranslationReqBuilder) Build() *TranslationReq {
 	r := &TranslationReq{}
@@ -75,6 +82,7 @@ func (b TranslationReqBuilder) Build() *TranslationReq {
 	r.VAddr = b.vAddr
 	r.PID = b.pid
 	r.DeviceID = b.deviceID
+	r.Migrate = b.migrate
 	return r
 }
 
