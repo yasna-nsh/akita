@@ -11,7 +11,7 @@ type PID uint32
 // Per-page migration policy
 type MigrationPolicy int
 
-const MigrationThreshold = 0
+const MigrationThreshold = 256
 
 const (
 	PolicyOnTouch MigrationPolicy = iota
