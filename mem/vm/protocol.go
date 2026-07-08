@@ -12,6 +12,7 @@ type TranslationReq struct {
 	PID      PID
 	DeviceID uint64
 	Migrate  bool // modify this based on policy and access counter
+	Write    bool // specify if translation request is for a read or write
 }
 
 // Meta returns the meta data associated with the message.
@@ -27,6 +28,7 @@ type TranslationReqBuilder struct {
 	pid      PID
 	deviceID uint64
 	migrate  bool
+	isWrite  bool
 }
 
 // WithSendTime sets the send time of the request to build.:w
@@ -72,6 +74,11 @@ func (b TranslationReqBuilder) WithMigrate(migrate bool) TranslationReqBuilder {
 	return b
 }
 
+func (b TranslationReqBuilder) WithWrite(w bool) TranslationReqBuilder {
+	b.isWrite = w
+	return b
+}
+
 // Build creates a new TranslationReq
 func (b TranslationReqBuilder) Build() *TranslationReq {
 	r := &TranslationReq{}
@@ -83,6 +90,7 @@ func (b TranslationReqBuilder) Build() *TranslationReq {
 	r.PID = b.pid
 	r.DeviceID = b.deviceID
 	r.Migrate = b.migrate
+	r.Write = b.isWrite
 	return r
 }
 
@@ -216,4 +224,54 @@ func NewPageMigrationRspFromDriver(
 	cmd.Src = src
 	cmd.Dst = dst
 	return cmd
+}
+
+// mmu notifies driver of page fault to update otable
+type PageFaultNotification struct {
+	sim.MsgMeta
+	PID   PID
+	VAddr uint64
+	Write bool
+}
+
+func (m *PageFaultNotification) Meta() *sim.MsgMeta { return &m.MsgMeta }
+
+type PageFaultNotificationBuilder struct {
+	sendTime sim.VTimeInSec
+	src, dst sim.Port
+	pid      PID
+	vAddr    uint64
+	write    bool
+}
+
+func (b PageFaultNotificationBuilder) WithSendTime(t sim.VTimeInSec) PageFaultNotificationBuilder {
+	b.sendTime = t
+	return b
+}
+func (b PageFaultNotificationBuilder) WithSrc(p sim.Port) PageFaultNotificationBuilder {
+	b.src = p
+	return b
+}
+func (b PageFaultNotificationBuilder) WithDst(p sim.Port) PageFaultNotificationBuilder {
+	b.dst = p
+	return b
+}
+func (b PageFaultNotificationBuilder) WithPID(pid PID) PageFaultNotificationBuilder {
+	b.pid = pid
+	return b
+}
+func (b PageFaultNotificationBuilder) WithVAddr(v uint64) PageFaultNotificationBuilder {
+	b.vAddr = v
+	return b
+}
+func (b PageFaultNotificationBuilder) WithWrite(w bool) PageFaultNotificationBuilder {
+	b.write = w
+	return b
+}
+
+func (b PageFaultNotificationBuilder) Build() *PageFaultNotification {
+	m := &PageFaultNotification{PID: b.pid, VAddr: b.vAddr, Write: b.write}
+	m.ID = sim.GetIDGenerator().Generate()
+	m.Src, m.Dst, m.SendTime = b.src, b.dst, b.sendTime
+	return m
 }

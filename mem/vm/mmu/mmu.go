@@ -22,8 +22,10 @@ type MMU struct {
 
 	topPort       sim.Port
 	migrationPort sim.Port
+	pageFaultPort sim.Port
 
 	MigrationServiceProvider sim.Port
+	PageFaultServiceProvider sim.Port
 
 	topSender sim.BufferedSender
 
@@ -40,8 +42,9 @@ type MMU struct {
 	toRemoveFromPTW        []int
 	PageAccessedByDeviceID map[uint64][]uint64
 
-	migrationPolicy vm.MigrationPolicy
-	useOASIS        bool
+	migrationPolicy   vm.MigrationPolicy
+	useOASIS          bool
+	pendingPageFaults []*vm.PageFaultNotification
 }
 
 // Tick defines how the MMU update state each cycle
@@ -53,6 +56,7 @@ func (mmu *MMU) Tick(now sim.VTimeInSec) bool {
 	madeProgress = mmu.walkPageTable(now) || madeProgress
 	madeProgress = mmu.processMigrationReturn(now) || madeProgress
 	madeProgress = mmu.parseFromTop(now) || madeProgress
+	madeProgress = mmu.sendPageFaultNotifications(now) || madeProgress
 
 	return madeProgress
 }
@@ -105,6 +109,33 @@ func (mmu *MMU) finalizePageWalk(
 	return mmu.doPageWalkHit(now, walkingIndex)
 }
 
+func (mmu *MMU) notifyPageFault(page vm.Page, req *vm.TranslationReq) {
+	notif := vm.PageFaultNotificationBuilder{}.
+		WithSendTime(0). // set at actual send time below
+		WithSrc(mmu.pageFaultPort).
+		WithDst(mmu.PageFaultServiceProvider).
+		WithPID(req.PID).
+		WithVAddr(page.VAddr).
+		WithWrite(req.Write).
+		Build()
+
+	mmu.pendingPageFaults = append(mmu.pendingPageFaults, notif)
+}
+
+func (mmu *MMU) sendPageFaultNotifications(now sim.VTimeInSec) bool {
+	if len(mmu.pendingPageFaults) == 0 {
+		return false
+	}
+	notif := mmu.pendingPageFaults[0]
+	notif.SendTime = now
+	err := mmu.migrationPort.Send(notif)
+	if err != nil {
+		return false
+	}
+	mmu.pendingPageFaults = mmu.pendingPageFaults[1:]
+	return true
+}
+
 func (mmu *MMU) addTransactionToMigrationQueue(walkingIndex int) bool {
 	if len(mmu.migrationQueue) >= mmu.migrationQueueSize {
 		return false
@@ -134,6 +165,11 @@ func (mmu *MMU) pageNeedMigrate(walking transaction) bool {
 
 	if page.IsPinned {
 		return false
+	}
+
+	// notify driver to record page fault in object table
+	if mmu.useOASIS && mmu.pageFaultPort != nil {
+		mmu.notifyPageFault(page, walking.req)
 	}
 
 	switch page.MigrationPolicy {

@@ -139,6 +139,11 @@ func (t *AddressTranslator) translate(now sim.VTimeInSec) bool {
 	req := item.(mem.AccessReq)
 	vAddr := req.GetAddress()
 	vPageID := t.addrToPageID(vAddr)
+	write := false
+	switch req.(type) {
+	case *mem.WriteReq:
+		write = true
+	}
 
 	transReqBuilder := vm.TranslationReqBuilder{}.
 		WithSendTime(now).
@@ -146,7 +151,8 @@ func (t *AddressTranslator) translate(now sim.VTimeInSec) bool {
 		WithDst(t.translationProvider).
 		WithPID(req.GetPID()).
 		WithVAddr(vPageID).
-		WithDeviceID(t.deviceID)
+		WithDeviceID(t.deviceID).
+		WithWrite(write)
 
 	if remaining, tracked := t.remainingAccesses[vPageID]; tracked {
 		remaining--

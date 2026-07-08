@@ -12,6 +12,7 @@ type Builder struct {
 	log2PageSize             uint64
 	pageTable                vm.PageTable
 	migrationServiceProvider sim.Port
+	pageFaultServiceProvider sim.Port
 	maxNumReqInFlight        int
 	pageWalkingLatency       int
 
@@ -59,6 +60,11 @@ func (b Builder) WithMigrationServiceProvider(p sim.Port) Builder {
 	return b
 }
 
+func (b Builder) WithPageFaultServiceProvider(p sim.Port) Builder {
+	b.pageFaultServiceProvider = p
+	return b
+}
+
 // WithMaxNumReqInFlight sets the number of requests can be concurrently
 // processed by the MMU.
 func (b Builder) WithMaxNumReqInFlight(n int) Builder {
@@ -94,12 +100,14 @@ func (b Builder) Build(name string) *MMU {
 	b.configureInternalStates(mmu)
 	mmu.migrationPolicy = b.migrationPolicy
 	mmu.useOASIS = b.useOASIS
+	mmu.pendingPageFaults = make([]*vm.PageFaultNotification, 0)
 
 	return mmu
 }
 
 func (b Builder) configureInternalStates(mmu *MMU) {
 	mmu.MigrationServiceProvider = b.migrationServiceProvider
+	mmu.PageFaultServiceProvider = b.pageFaultServiceProvider
 	mmu.migrationQueueSize = 4096
 	mmu.maxRequestsInFlight = b.maxNumReqInFlight
 	mmu.latency = b.pageWalkingLatency
@@ -119,6 +127,8 @@ func (b Builder) createPorts(name string, mmu *MMU) {
 	mmu.AddPort("Top", mmu.topPort)
 	mmu.migrationPort = sim.NewLimitNumMsgPort(mmu, 1, name+".MigrationPort")
 	mmu.AddPort("Migration", mmu.migrationPort)
+	mmu.pageFaultPort = sim.NewLimitNumMsgPort(mmu, 1, name+".PageFaultPort")
+	mmu.AddPort("PageFault", mmu.pageFaultPort)
 
 	mmu.topSender = sim.NewBufferedSender(
 		mmu.topPort, sim.NewBuffer(name+".TopSenderBuffer", 4096))
