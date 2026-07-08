@@ -128,7 +128,7 @@ func (mmu *MMU) sendPageFaultNotifications(now sim.VTimeInSec) bool {
 	}
 	notif := mmu.pendingPageFaults[0]
 	notif.SendTime = now
-	err := mmu.migrationPort.Send(notif)
+	err := mmu.pageFaultPort.Send(notif)
 	if err != nil {
 		return false
 	}
