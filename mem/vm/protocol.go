@@ -15,8 +15,32 @@ type TranslationReq struct {
 	Write    bool // specify if translation request is for a read or write
 }
 
+// to update policy after OASIS's object controller decides on a new policy
+type UpdatePolicyReq struct {
+	sim.MsgMeta
+	ObjID     uint8
+	BaseVAddr uint64
+	Size      uint64
+	NewPolicy MigrationPolicy
+}
+
+// to invalidate read-only copies of pages when policy is duplication and one processor wants to write
+type InvalidatePageReq struct {
+	sim.MsgMeta
+	VAddr uint64
+	PID   PID
+}
+
 // Meta returns the meta data associated with the message.
 func (r *TranslationReq) Meta() *sim.MsgMeta {
+	return &r.MsgMeta
+}
+
+func (r *UpdatePolicyReq) Meta() *sim.MsgMeta {
+	return &r.MsgMeta
+}
+
+func (r *InvalidatePageReq) Meta() *sim.MsgMeta {
 	return &r.MsgMeta
 }
 

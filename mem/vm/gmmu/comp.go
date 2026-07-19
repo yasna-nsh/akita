@@ -40,6 +40,8 @@ type Comp struct {
 
 	toRemoveFromPTW        []int
 	PageAccessedByDeviceID map[uint64][]uint64
+
+	remainingAccesses map[uint64]int
 }
 
 // Tick defines how the gmmu update state each cycle
@@ -99,9 +101,9 @@ func (gmmu *Comp) walkPageTable(now sim.VTimeInSec) bool {
 		}
 		req := gmmu.walkingTranslations[i].req
 
-		page, _ := gmmu.pageTable.Find(req.PID, req.VAddr)
+		page, found := gmmu.pageTable.Find(req.PID, req.VAddr)
 
-		if page.DeviceID == gmmu.deviceID {
+		if found && page.Valid && gmmu.canServeLocally(page, req) {
 			madeProgress = gmmu.finalizePageWalk(now, i) || madeProgress
 		} else {
 			madeProgress = gmmu.processRemoteMemReq(now, i) || madeProgress
@@ -120,12 +122,64 @@ func (gmmu *Comp) walkPageTable(now sim.VTimeInSec) bool {
 	return madeProgress
 }
 
+// canServeLocally decides whether we should go back to the MMU or not
+func (gmmu *Comp) canServeLocally(page vm.Page, req *vm.TranslationReq) bool {
+	if page.DeviceID == gmmu.deviceID {
+		return true
+	}
+	if page.IsPinned {
+		// pinned pages never migrate again, so a cached translation for
+		// them stays valid regardless of policy
+		return true
+	}
+
+	switch page.MigrationPolicy {
+	case vm.PolicyAccessCounter:
+		return !gmmu.accessCounterExpired(page.VAddr)
+
+	case vm.PolicyDuplication:
+		// if read, answer localy from read-only copy
+		return !req.Write
+
+	default: // on touch or other policy: always send to MMU
+		return false
+	}
+}
+
+// initialize/decrement the local access counter for vAddr, return true if hit zero
+func (gmmu *Comp) accessCounterExpired(vAddr uint64) bool {
+	if gmmu.remainingAccesses == nil {
+		gmmu.remainingAccesses = make(map[uint64]int)
+	}
+
+	remaining, tracked := gmmu.remainingAccesses[vAddr]
+	if !tracked {
+		gmmu.remainingAccesses[vAddr] = vm.MigrationThreshold - 1
+		return false
+	}
+
+	remaining--
+	if remaining < 0 {
+		delete(gmmu.remainingAccesses, vAddr)
+		return true
+	}
+	gmmu.remainingAccesses[vAddr] = remaining
+	return false
+}
+
+// request goes to mmu
 func (gmmu *Comp) processRemoteMemReq(now sim.VTimeInSec, walkingIndex int) bool {
 	// if !gmmu.bottomSender.CanSend(1) {
 	// 	return false
 	// }
 
 	walking := gmmu.walkingTranslations[walkingIndex].req
+
+	forceMigrate := false
+	if page, found := gmmu.pageTable.Find(walking.PID, walking.VAddr); found && page.Valid {
+		// if the page is found in page table and is valid but canServeLocally returns false, we end up here
+		forceMigrate = true
+	}
 
 	gmmu.remoteMemReqs[walking.VAddr] = gmmu.walkingTranslations[walkingIndex]
 
@@ -136,6 +190,8 @@ func (gmmu *Comp) processRemoteMemReq(now sim.VTimeInSec, walkingIndex int) bool
 		WithPID(walking.PID).
 		WithVAddr(walking.VAddr).
 		WithDeviceID(walking.DeviceID).
+		WithMigrate(forceMigrate).
+		WithWrite(walking.Write).
 		Build()
 
 	err := gmmu.bottomPort.Send(req)
@@ -211,6 +267,16 @@ func (gmmu *Comp) fetchFromBottom(now sim.VTimeInSec) bool {
 	switch req := req.(type) {
 	case *vm.TranslationRsp:
 		return gmmu.handleTranslationRsp(now, req)
+	case *vm.InvalidatePageReq:
+		page, found := gmmu.pageTable.Find(req.PID, req.VAddr)
+		if found {
+			page.Valid = false
+			gmmu.pageTable.Update(page)
+		}
+		return gmmu.handleInvalidatePageReq(now, req)
+	case *vm.UpdatePolicyReq:
+		// TODO: cycle on pages in object and update their policy, update policy in tlbs too if requests flow through tlb to get to gmmu
+		return true
 	default:
 		log.Panicf("gmmu canot handle request of type %s", reflect.TypeOf(req))
 	}
@@ -220,6 +286,11 @@ func (gmmu *Comp) fetchFromBottom(now sim.VTimeInSec) bool {
 
 func (gmmu *Comp) handleTranslationRsp(now sim.VTimeInSec, rsponse *vm.TranslationRsp) bool {
 	reqTransaction := gmmu.remoteMemReqs[rsponse.Page.VAddr]
+	if _, found := gmmu.pageTable.Find(rsponse.Page.PID, rsponse.Page.VAddr); found {
+		gmmu.pageTable.Update(rsponse.Page)
+	} else {
+		gmmu.pageTable.Insert(rsponse.Page)
+	}
 
 	rsp := vm.TranslationRspBuilder{}.
 		WithSendTime(now).
@@ -232,5 +303,10 @@ func (gmmu *Comp) handleTranslationRsp(now sim.VTimeInSec, rsponse *vm.Translati
 	gmmu.topSender.Send(rsp)
 
 	delete(gmmu.remoteMemReqs, rsponse.Page.VAddr)
+	return true
+}
+
+func (gmmu *Comp) handleInvalidatePageReq(now sim.VTimeInSec, rsponse *vm.InvalidatePageReq) bool {
+	// TODO: invalidate page in tlbs and l0
 	return true
 }
