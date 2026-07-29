@@ -36,12 +36,14 @@ type Comp struct {
 	maxRequestsInFlight int
 
 	walkingTranslations []transaction
-	remoteMemReqs       map[uint64]transaction
+	remoteMemReqs       map[string]transaction
 
 	toRemoveFromPTW        []int
 	PageAccessedByDeviceID map[uint64][]uint64
 
-	remainingAccesses map[uint64]int
+	ToAT                    sim.Port
+	remainingAccesses       map[uint64]int
+	pendingForcedMigrations map[uint64]vm.PID
 }
 
 // Tick defines how the gmmu update state each cycle
@@ -52,6 +54,7 @@ func (gmmu *Comp) Tick(now sim.VTimeInSec) bool {
 	madeProgress = gmmu.parseFromTop(now) || madeProgress
 	madeProgress = gmmu.walkPageTable(now) || madeProgress
 	madeProgress = gmmu.fetchFromBottom(now) || madeProgress
+	madeProgress = gmmu.fetchFromAT(now) || madeProgress
 
 	return madeProgress
 }
@@ -181,8 +184,6 @@ func (gmmu *Comp) processRemoteMemReq(now sim.VTimeInSec, walkingIndex int) bool
 		forceMigrate = true
 	}
 
-	gmmu.remoteMemReqs[walking.VAddr] = gmmu.walkingTranslations[walkingIndex]
-
 	req := vm.TranslationReqBuilder{}.
 		WithSendTime(now).
 		WithSrc(gmmu.bottomPort).
@@ -194,8 +195,8 @@ func (gmmu *Comp) processRemoteMemReq(now sim.VTimeInSec, walkingIndex int) bool
 		WithWrite(walking.Write).
 		Build()
 
+	gmmu.remoteMemReqs[req.ID] = gmmu.walkingTranslations[walkingIndex]
 	err := gmmu.bottomPort.Send(req)
-
 	if err != nil {
 		return false
 	}
@@ -275,8 +276,7 @@ func (gmmu *Comp) fetchFromBottom(now sim.VTimeInSec) bool {
 		}
 		return gmmu.handleInvalidatePageReq(now, req)
 	case *vm.UpdatePolicyReq:
-		// TODO: cycle on pages in object and update their policy, update policy in tlbs too if requests flow through tlb to get to gmmu
-		return true
+		return gmmu.UpdatePagePolicy(req)
 	default:
 		log.Panicf("gmmu canot handle request of type %s", reflect.TypeOf(req))
 	}
@@ -284,29 +284,129 @@ func (gmmu *Comp) fetchFromBottom(now sim.VTimeInSec) bool {
 	return true
 }
 
+func (gmmu *Comp) UpdatePagePolicy(req *vm.UpdatePolicyReq) bool {
+	page, find := gmmu.pageTable.Find(req.PID, req.VAddr)
+	if find {
+		page.MigrationPolicy = req.NewPolicy
+		gmmu.pageTable.Update(page)
+	}
+	return true
+}
+
+func (gmmu *Comp) fetchFromAT(now sim.VTimeInSec) bool {
+	req := gmmu.ToAT.Retrieve(now)
+	if req == nil {
+		return false
+	}
+
+	switch req := req.(type) {
+	case *vm.UpdateCounterReq:
+		return gmmu.updateCounter(now, req)
+	default:
+		log.Panicf("gmmu cannot handle request of type %s", reflect.TypeOf(req))
+	}
+
+	return true
+}
+
+// TODO: update L1TLBs and L2TLB and caches if duplicate invalidation happens
 func (gmmu *Comp) handleTranslationRsp(now sim.VTimeInSec, rsponse *vm.TranslationRsp) bool {
-	reqTransaction := gmmu.remoteMemReqs[rsponse.Page.VAddr]
+	if _, ok := gmmu.pendingForcedMigrations[rsponse.Page.VAddr]; ok {
+		delete(gmmu.pendingForcedMigrations, rsponse.Page.VAddr)
+		gmmu.cachePage(rsponse.Page)
+		return true
+	}
+
+	reqTransaction := gmmu.remoteMemReqs[rsponse.RespondTo]
 	if _, found := gmmu.pageTable.Find(rsponse.Page.PID, rsponse.Page.VAddr); found {
 		gmmu.pageTable.Update(rsponse.Page)
 	} else {
 		gmmu.pageTable.Insert(rsponse.Page)
+		if rsponse.Page.MigrationPolicy == vm.PolicyAccessCounter {
+			gmmu.initCounter(rsponse.Page.VAddr)
+		}
 	}
 
 	rsp := vm.TranslationRspBuilder{}.
 		WithSendTime(now).
 		WithSrc(gmmu.topPort).
 		WithDst(reqTransaction.req.Src).
-		WithRspTo(rsponse.ID).
+		WithRspTo(reqTransaction.req.ID).
 		WithPage(rsponse.Page).
 		Build()
 
 	gmmu.topSender.Send(rsp)
 
-	delete(gmmu.remoteMemReqs, rsponse.Page.VAddr)
+	delete(gmmu.remoteMemReqs, rsponse.RespondTo)
 	return true
+}
+
+func (gmmu *Comp) initCounter(vAddr uint64) {
+	log.Printf("initiated counter for page with vaddr %v\n", vAddr)
+	if gmmu.remainingAccesses == nil {
+		gmmu.remainingAccesses = make(map[uint64]int)
+	}
+	gmmu.remainingAccesses[vAddr] = vm.MigrationThreshold
+}
+
+func (gmmu *Comp) cachePage(page vm.Page) {
+	if _, found := gmmu.pageTable.Find(page.PID, page.VAddr); found {
+		gmmu.pageTable.Update(page)
+	} else {
+		gmmu.pageTable.Insert(page)
+	}
+	delete(gmmu.remainingAccesses, page.VAddr)
 }
 
 func (gmmu *Comp) handleInvalidatePageReq(now sim.VTimeInSec, rsponse *vm.InvalidatePageReq) bool {
 	// TODO: invalidate page in tlbs and l0
 	return true
+}
+
+// decrease counter only if page is being tracked already
+func (gmmu *Comp) updateCounter(now sim.VTimeInSec, req *vm.UpdateCounterReq) bool {
+	page, found := gmmu.pageTable.Find(req.PID, req.VAddr)
+	if !found || page.DeviceID == gmmu.deviceID {
+		return true
+	}
+
+	if gmmu.remainingAccesses == nil {
+		gmmu.remainingAccesses = make(map[uint64]int)
+	}
+	vAddr := req.VAddr
+	remaining, tracked := gmmu.remainingAccesses[vAddr]
+	if !tracked {
+		return true
+	}
+
+	remaining--
+	if remaining <= 0 {
+		delete(gmmu.remainingAccesses, vAddr)
+		log.Printf("req.vaddr=%v, forcing migration from %v to %v \n", req.VAddr, page.DeviceID, req.DeviceID)
+		// TODO: request remote
+		gmmu.requestForcedMigration(now, req.PID, req.VAddr, req.Write)
+
+		return true
+	}
+	gmmu.remainingAccesses[vAddr] = remaining
+	return true
+}
+
+func (gmmu *Comp) requestForcedMigration(now sim.VTimeInSec, pid vm.PID, vAddr uint64, write bool) {
+	req := vm.TranslationReqBuilder{}.
+		WithSendTime(now).
+		WithSrc(gmmu.bottomPort).
+		WithDst(gmmu.LowModule).
+		WithPID(pid).
+		WithVAddr(vAddr).
+		WithDeviceID(gmmu.deviceID).
+		WithMigrate(true).
+		WithWrite(write).
+		Build()
+	gmmu.bottomPort.Send(req)
+
+	if gmmu.pendingForcedMigrations == nil {
+		gmmu.pendingForcedMigrations = make(map[uint64]vm.PID)
+	}
+	gmmu.pendingForcedMigrations[vAddr] = pid
 }

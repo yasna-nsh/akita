@@ -45,6 +45,9 @@ type MMU struct {
 	migrationPolicy   vm.MigrationPolicy
 	useOASIS          bool
 	pendingPageFaults []*vm.PageFaultNotification
+
+	toGMMUs   sim.Port
+	GMMUPorts map[uint64]sim.Port
 }
 
 // Tick defines how the MMU update state each cycle
@@ -57,6 +60,7 @@ func (mmu *MMU) Tick(now sim.VTimeInSec) bool {
 	madeProgress = mmu.processMigrationReturn(now) || madeProgress
 	madeProgress = mmu.parseFromTop(now) || madeProgress
 	madeProgress = mmu.sendPageFaultNotifications(now) || madeProgress
+	madeProgress = mmu.receivePageFaultRsps(now) || madeProgress
 
 	return madeProgress
 }
@@ -133,6 +137,42 @@ func (mmu *MMU) sendPageFaultNotifications(now sim.VTimeInSec) bool {
 		return false
 	}
 	mmu.pendingPageFaults = mmu.pendingPageFaults[1:]
+	return true
+}
+
+func (mmu *MMU) receivePageFaultRsps(now sim.VTimeInSec) bool {
+	rsp := mmu.pageFaultPort.Retrieve(now)
+	if rsp == nil {
+		return false
+	}
+	res := rsp.(*vm.PageFaultNotificationRsp)
+	if res.Changed {
+		for vaddr := res.BaseVAddr; vaddr < res.BaseVAddr+res.Size; {
+			page, found := mmu.pageTable.Find(res.PID, vaddr)
+			if found {
+				// update policy in mmu
+				page.MigrationPolicy = res.NewPolicy
+				mmu.pageTable.Update(page)
+				// notify gmmu of page's owner to update policy
+				port := mmu.GMMUPorts[page.DeviceID]
+				req := vm.UpdatePolicyReqBuilder{}.
+					WithSendTime(now).
+					WithSrc(mmu.toGMMUs).
+					WithDst(port).
+					WithPID(res.PID).
+					WithVAddr(vaddr).
+					WithNewPolicy(res.NewPolicy).
+					Build()
+				e := port.Send(req)
+				if e != nil {
+					log.Panicln("Couldn't notify GMMUs of change in policy.")
+				}
+				vaddr += page.PageSize
+			} else {
+				vaddr += 4096
+			}
+		}
+	}
 	return true
 }
 

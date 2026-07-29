@@ -48,12 +48,18 @@ type AddressTranslator struct {
 	currentGL0InvReq               *mem.GL0InvalidateReq
 	totalRequestsUponGL0InvArrival int
 
+	gmmuPort          sim.Port
+	gmmuPortDst       sim.Port
 	remainingAccesses map[uint64]int
 }
 
 // SetTranslationProvider sets the remote port that can translate addresses.
 func (t *AddressTranslator) SetTranslationProvider(p sim.Port) {
 	t.translationProvider = p
+}
+
+func (t *AddressTranslator) SetGmmuDstPort(p sim.Port) {
+	t.gmmuPortDst = p
 }
 
 // SetLowModuleFinder sets the table recording where to find an address.
@@ -145,6 +151,20 @@ func (t *AddressTranslator) translate(now sim.VTimeInSec) bool {
 		write = true
 	}
 
+	updateCountReqBuilder := vm.UpdateCounterReqBuilder{}.
+		WithSendTime(now).
+		WithSrc(t.gmmuPort).
+		WithDst(t.gmmuPortDst).
+		WithVAddr(vPageID).
+		WithPID(req.GetPID()).
+		WithDeviceID(t.deviceID).
+		WithWrite(write)
+	updateCountReq := updateCountReqBuilder.Build()
+	e := t.gmmuPort.Send(updateCountReq)
+	if e != nil {
+		return false
+	}
+
 	transReqBuilder := vm.TranslationReqBuilder{}.
 		WithSendTime(now).
 		WithSrc(t.translationPort).
@@ -153,16 +173,6 @@ func (t *AddressTranslator) translate(now sim.VTimeInSec) bool {
 		WithVAddr(vPageID).
 		WithDeviceID(t.deviceID).
 		WithWrite(write)
-
-	if remaining, tracked := t.remainingAccesses[vPageID]; tracked {
-		remaining--
-		if remaining <= 0 {
-			delete(t.remainingAccesses, vPageID)
-			transReqBuilder = transReqBuilder.WithMigrate(true)
-		} else {
-			t.remainingAccesses[vPageID] = remaining
-		}
-	}
 
 	transReq := transReqBuilder.Build()
 	err := t.translationPort.Send(transReq)

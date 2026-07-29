@@ -18,9 +18,8 @@ type TranslationReq struct {
 // to update policy after OASIS's object controller decides on a new policy
 type UpdatePolicyReq struct {
 	sim.MsgMeta
-	ObjID     uint8
-	BaseVAddr uint64
-	Size      uint64
+	PID       PID
+	VAddr     uint64
 	NewPolicy MigrationPolicy
 }
 
@@ -29,6 +28,15 @@ type InvalidatePageReq struct {
 	sim.MsgMeta
 	VAddr uint64
 	PID   PID
+}
+
+// from address translators to the GMMU
+type UpdateCounterReq struct {
+	sim.MsgMeta
+	VAddr    uint64
+	PID      PID
+	DeviceID uint64
+	Write    bool // specify if translation request is for a read or write
 }
 
 // Meta returns the meta data associated with the message.
@@ -41,6 +49,10 @@ func (r *UpdatePolicyReq) Meta() *sim.MsgMeta {
 }
 
 func (r *InvalidatePageReq) Meta() *sim.MsgMeta {
+	return &r.MsgMeta
+}
+
+func (r *UpdateCounterReq) Meta() *sim.MsgMeta {
 	return &r.MsgMeta
 }
 
@@ -188,6 +200,69 @@ func (b TranslationRspBuilder) Build() *TranslationRsp {
 	return r
 }
 
+type UpdateCounterReqBuilder struct {
+	sendTime sim.VTimeInSec
+	src, dst sim.Port
+	vAddr    uint64
+	pid      PID
+	deviceID uint64
+	write    bool
+}
+
+func (b UpdateCounterReqBuilder) WithSendTime(
+	t sim.VTimeInSec,
+) UpdateCounterReqBuilder {
+	b.sendTime = t
+	return b
+}
+
+// WithSrc sets the source of the request to build.
+func (b UpdateCounterReqBuilder) WithSrc(src sim.Port) UpdateCounterReqBuilder {
+	b.src = src
+	return b
+}
+
+// WithDst sets the destination of the request to build.
+func (b UpdateCounterReqBuilder) WithDst(dst sim.Port) UpdateCounterReqBuilder {
+	b.dst = dst
+	return b
+}
+
+// WithVAddr sets the virtual address of the request to build.
+func (b UpdateCounterReqBuilder) WithVAddr(vAddr uint64) UpdateCounterReqBuilder {
+	b.vAddr = vAddr
+	return b
+}
+
+func (b UpdateCounterReqBuilder) WithPID(pid PID) UpdateCounterReqBuilder {
+	b.pid = pid
+	return b
+}
+
+// WithDeviceID sets the GPU ID of the request to build.
+func (b UpdateCounterReqBuilder) WithDeviceID(deviceID uint64) UpdateCounterReqBuilder {
+	b.deviceID = deviceID
+	return b
+}
+
+func (b UpdateCounterReqBuilder) WithWrite(w bool) UpdateCounterReqBuilder {
+	b.write = w
+	return b
+}
+
+func (b UpdateCounterReqBuilder) Build() *UpdateCounterReq {
+	r := &UpdateCounterReq{}
+	r.ID = sim.GetIDGenerator().Generate()
+	r.Src = b.src
+	r.Dst = b.dst
+	r.SendTime = b.sendTime
+	r.VAddr = b.vAddr
+	r.PID = b.pid
+	r.DeviceID = b.deviceID
+	r.Write = b.write
+	return r
+}
+
 type PageMigrationInfo struct {
 	GPUReqToVAddrMap map[uint64][]uint64
 }
@@ -258,7 +333,18 @@ type PageFaultNotification struct {
 	Write bool
 }
 
+type PageFaultNotificationRsp struct {
+	sim.MsgMeta
+	PID       PID
+	BaseVAddr uint64
+	Size      uint64
+	Changed   bool
+	NewPolicy MigrationPolicy
+}
+
 func (m *PageFaultNotification) Meta() *sim.MsgMeta { return &m.MsgMeta }
+
+func (m *PageFaultNotificationRsp) Meta() *sim.MsgMeta { return &m.MsgMeta }
 
 type PageFaultNotificationBuilder struct {
 	sendTime sim.VTimeInSec
@@ -295,6 +381,98 @@ func (b PageFaultNotificationBuilder) WithWrite(w bool) PageFaultNotificationBui
 
 func (b PageFaultNotificationBuilder) Build() *PageFaultNotification {
 	m := &PageFaultNotification{PID: b.pid, VAddr: b.vAddr, Write: b.write}
+	m.ID = sim.GetIDGenerator().Generate()
+	m.Src, m.Dst, m.SendTime = b.src, b.dst, b.sendTime
+	return m
+}
+
+type PageFaultNotificationRspBuilder struct {
+	sendTime  sim.VTimeInSec
+	src, dst  sim.Port
+	pid       PID
+	baseVAddr uint64
+	size      uint64
+	changed   bool
+	newPolicy MigrationPolicy
+}
+
+func (b PageFaultNotificationRspBuilder) WithSendTime(t sim.VTimeInSec) PageFaultNotificationRspBuilder {
+	b.sendTime = t
+	return b
+}
+func (b PageFaultNotificationRspBuilder) WithSrc(p sim.Port) PageFaultNotificationRspBuilder {
+	b.src = p
+	return b
+}
+func (b PageFaultNotificationRspBuilder) WithDst(p sim.Port) PageFaultNotificationRspBuilder {
+	b.dst = p
+	return b
+}
+func (b PageFaultNotificationRspBuilder) WithPID(pid PID) PageFaultNotificationRspBuilder {
+	b.pid = pid
+	return b
+}
+func (b PageFaultNotificationRspBuilder) WithBaseVAddr(v uint64) PageFaultNotificationRspBuilder {
+	b.baseVAddr = v
+	return b
+}
+func (b PageFaultNotificationRspBuilder) WithSize(s uint64) PageFaultNotificationRspBuilder {
+	b.size = s
+	return b
+}
+func (b PageFaultNotificationRspBuilder) WithChanged(c bool) PageFaultNotificationRspBuilder {
+	b.changed = c
+	return b
+}
+
+func (b PageFaultNotificationRspBuilder) WithNewPolicy(p MigrationPolicy) PageFaultNotificationRspBuilder {
+	b.newPolicy = p
+	return b
+}
+
+func (b PageFaultNotificationRspBuilder) Build() *PageFaultNotificationRsp {
+	m := &PageFaultNotificationRsp{PID: b.pid, BaseVAddr: b.baseVAddr, Size: b.size, Changed: b.changed, NewPolicy: b.newPolicy}
+	m.ID = sim.GetIDGenerator().Generate()
+	m.Src, m.Dst, m.SendTime = b.src, b.dst, b.sendTime
+	return m
+}
+
+type UpdatePolicyReqBuilder struct {
+	sendTime  sim.VTimeInSec
+	src, dst  sim.Port
+	pid       PID
+	vAddr     uint64
+	newPolicy MigrationPolicy
+}
+
+func (b UpdatePolicyReqBuilder) WithSendTime(t sim.VTimeInSec) UpdatePolicyReqBuilder {
+	b.sendTime = t
+	return b
+}
+func (b UpdatePolicyReqBuilder) WithSrc(p sim.Port) UpdatePolicyReqBuilder {
+	b.src = p
+	return b
+}
+func (b UpdatePolicyReqBuilder) WithDst(p sim.Port) UpdatePolicyReqBuilder {
+	b.dst = p
+	return b
+}
+func (b UpdatePolicyReqBuilder) WithPID(pid PID) UpdatePolicyReqBuilder {
+	b.pid = pid
+	return b
+}
+func (b UpdatePolicyReqBuilder) WithVAddr(v uint64) UpdatePolicyReqBuilder {
+	b.vAddr = v
+	return b
+}
+
+func (b UpdatePolicyReqBuilder) WithNewPolicy(p MigrationPolicy) UpdatePolicyReqBuilder {
+	b.newPolicy = p
+	return b
+}
+
+func (b UpdatePolicyReqBuilder) Build() *UpdatePolicyReq {
+	m := &UpdatePolicyReq{PID: b.pid, VAddr: b.vAddr, NewPolicy: b.newPolicy}
 	m.ID = sim.GetIDGenerator().Generate()
 	m.Src, m.Dst, m.SendTime = b.src, b.dst, b.sendTime
 	return m

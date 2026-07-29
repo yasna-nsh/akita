@@ -33,6 +33,7 @@ type Page struct {
 	IsPinned    bool
 
 	MigrationPolicy MigrationPolicy
+	ReadOnly        bool
 }
 
 // A PageTable holds the a list of pages.

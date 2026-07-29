@@ -111,4 +111,7 @@ func (b Builder) createPorts(name string, t *AddressTranslator) {
 
 	t.ctrlPort = sim.NewLimitNumMsgPort(t, 1, name+".CtrlPort")
 	t.AddPort("Control", t.ctrlPort)
+
+	t.gmmuPort = sim.NewLimitNumMsgPort(t, b.numReqPerCycle, name+".ToGMMU")
+	t.AddPort("ToGMMU", t.gmmuPort)
 }

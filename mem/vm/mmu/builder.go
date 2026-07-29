@@ -129,7 +129,9 @@ func (b Builder) createPorts(name string, mmu *MMU) {
 	mmu.AddPort("Migration", mmu.migrationPort)
 	mmu.pageFaultPort = sim.NewLimitNumMsgPort(mmu, 1, name+".PageFaultPort")
 	mmu.AddPort("PageFault", mmu.pageFaultPort)
-
+	mmu.toGMMUs = sim.NewLimitNumMsgPort(mmu, 16, name+".ToGMMUs")
+	mmu.AddPort("ToGMMUs", mmu.toGMMUs)
+	mmu.GMMUPorts = make(map[uint64]sim.Port)
 	mmu.topSender = sim.NewBufferedSender(
 		mmu.topPort, sim.NewBuffer(name+".TopSenderBuffer", 4096))
 }

@@ -99,13 +99,15 @@ func (b Builder) createPorts(name string, gmmu *Comp) {
 	gmmu.AddPort("Top", gmmu.topPort)
 	gmmu.bottomPort = sim.NewLimitNumMsgPort(gmmu, 4096, name+".BottomPort")
 	gmmu.AddPort("Bottom", gmmu.bottomPort)
+	gmmu.ToAT = sim.NewLimitNumMsgPort(gmmu, 4096, name+".ToAT")
+	gmmu.AddPort("ToAT", gmmu.ToAT)
 
 	gmmu.topSender = sim.NewBufferedSender(
 		gmmu.topPort, sim.NewBuffer(name+".TopSenderBuffer", 4096))
 	gmmu.bottomSender = sim.NewBufferedSender(
 		gmmu.bottomPort, sim.NewBuffer(name+".BottomSenderBuffer", 4096))
 
-	gmmu.remoteMemReqs = make(map[uint64]transaction)
+	gmmu.remoteMemReqs = make(map[string]transaction)
 }
 
 func (b Builder) Build(name string) *Comp {
