@@ -15,44 +15,8 @@ type TranslationReq struct {
 	Write    bool // specify if translation request is for a read or write
 }
 
-// to update policy after OASIS's object controller decides on a new policy
-type UpdatePolicyReq struct {
-	sim.MsgMeta
-	PID       PID
-	VAddr     uint64
-	NewPolicy MigrationPolicy
-}
-
-// to invalidate read-only copies of pages when policy is duplication and one processor wants to write
-type InvalidatePageReq struct {
-	sim.MsgMeta
-	VAddr uint64
-	PID   PID
-}
-
-// from address translators to the GMMU
-type UpdateCounterReq struct {
-	sim.MsgMeta
-	VAddr    uint64
-	PID      PID
-	DeviceID uint64
-	Write    bool // specify if translation request is for a read or write
-}
-
 // Meta returns the meta data associated with the message.
 func (r *TranslationReq) Meta() *sim.MsgMeta {
-	return &r.MsgMeta
-}
-
-func (r *UpdatePolicyReq) Meta() *sim.MsgMeta {
-	return &r.MsgMeta
-}
-
-func (r *InvalidatePageReq) Meta() *sim.MsgMeta {
-	return &r.MsgMeta
-}
-
-func (r *UpdateCounterReq) Meta() *sim.MsgMeta {
 	return &r.MsgMeta
 }
 
@@ -200,6 +164,294 @@ func (b TranslationRspBuilder) Build() *TranslationRsp {
 	return r
 }
 
+type PageMigrationInfo struct {
+	GPUReqToVAddrMap map[uint64][]uint64
+}
+
+// PageMigrationReqToDriver is a req to driver from MMU to start page migration process
+type PageMigrationReqToDriver struct {
+	sim.MsgMeta
+
+	StartTime         sim.VTimeInSec
+	EndTime           sim.VTimeInSec
+	MigrationInfo     *PageMigrationInfo
+	CurrAccessingGPUs []uint64
+	PID               PID
+	CurrPageHostGPU   uint64
+	PageSize          uint64
+	RespondToTop      bool
+
+	IsDuplication bool
+	Write         bool
+}
+
+// Meta returns the meta data associated with the message.
+func (m *PageMigrationReqToDriver) Meta() *sim.MsgMeta {
+	return &m.MsgMeta
+}
+
+// NewPageMigrationReqToDriver creates a PageMigrationReqToDriver.
+func NewPageMigrationReqToDriver(
+	time sim.VTimeInSec,
+	src, dst sim.Port,
+) *PageMigrationReqToDriver {
+	cmd := new(PageMigrationReqToDriver)
+	cmd.SendTime = time
+	cmd.Src = src
+	cmd.Dst = dst
+	return cmd
+}
+
+// PageMigrationRspFromDriver is a rsp from driver to MMU marking completion of migration
+type PageMigrationRspFromDriver struct {
+	sim.MsgMeta
+
+	StartTime sim.VTimeInSec
+	EndTime   sim.VTimeInSec
+	VAddr     []uint64
+	RspToTop  bool
+
+	CopyPage *Page
+}
+
+// Meta returns the meta data associated with the message.
+func (m *PageMigrationRspFromDriver) Meta() *sim.MsgMeta {
+	return &m.MsgMeta
+}
+
+// NewPageMigrationRspFromDriver creates a new PageMigrationRspFromDriver.
+func NewPageMigrationRspFromDriver(
+	time sim.VTimeInSec,
+	src, dst sim.Port,
+) *PageMigrationRspFromDriver {
+	cmd := new(PageMigrationRspFromDriver)
+	cmd.SendTime = time
+	cmd.Src = src
+	cmd.Dst = dst
+	return cmd
+}
+
+// mmu notifies driver of page fault to update otable
+type PageFaultNotification struct {
+	sim.MsgMeta
+	PID   PID
+	VAddr uint64
+	Write bool
+}
+
+func (m *PageFaultNotification) Meta() *sim.MsgMeta { return &m.MsgMeta }
+
+type PageFaultNotificationBuilder struct {
+	sendTime sim.VTimeInSec
+	src, dst sim.Port
+	pid      PID
+	vAddr    uint64
+	write    bool
+}
+
+func (b PageFaultNotificationBuilder) WithSendTime(t sim.VTimeInSec) PageFaultNotificationBuilder {
+	b.sendTime = t
+	return b
+}
+func (b PageFaultNotificationBuilder) WithSrc(p sim.Port) PageFaultNotificationBuilder {
+	b.src = p
+	return b
+}
+func (b PageFaultNotificationBuilder) WithDst(p sim.Port) PageFaultNotificationBuilder {
+	b.dst = p
+	return b
+}
+func (b PageFaultNotificationBuilder) WithPID(pid PID) PageFaultNotificationBuilder {
+	b.pid = pid
+	return b
+}
+func (b PageFaultNotificationBuilder) WithVAddr(v uint64) PageFaultNotificationBuilder {
+	b.vAddr = v
+	return b
+}
+func (b PageFaultNotificationBuilder) WithWrite(w bool) PageFaultNotificationBuilder {
+	b.write = w
+	return b
+}
+
+func (b PageFaultNotificationBuilder) Build() *PageFaultNotification {
+	m := &PageFaultNotification{PID: b.pid, VAddr: b.vAddr, Write: b.write}
+	m.ID = sim.GetIDGenerator().Generate()
+	m.Src, m.Dst, m.SendTime = b.src, b.dst, b.sendTime
+	return m
+}
+
+type PageFaultNotificationRsp struct {
+	sim.MsgMeta
+	PID       PID
+	BaseVAddr uint64
+	Size      uint64
+	Changed   bool
+	NewPolicy MigrationPolicy
+}
+
+func (m *PageFaultNotificationRsp) Meta() *sim.MsgMeta { return &m.MsgMeta }
+
+type PageFaultNotificationRspBuilder struct {
+	sendTime  sim.VTimeInSec
+	src, dst  sim.Port
+	pid       PID
+	baseVAddr uint64
+	size      uint64
+	changed   bool
+	newPolicy MigrationPolicy
+}
+
+func (b PageFaultNotificationRspBuilder) WithSendTime(t sim.VTimeInSec) PageFaultNotificationRspBuilder {
+	b.sendTime = t
+	return b
+}
+func (b PageFaultNotificationRspBuilder) WithSrc(p sim.Port) PageFaultNotificationRspBuilder {
+	b.src = p
+	return b
+}
+func (b PageFaultNotificationRspBuilder) WithDst(p sim.Port) PageFaultNotificationRspBuilder {
+	b.dst = p
+	return b
+}
+func (b PageFaultNotificationRspBuilder) WithPID(pid PID) PageFaultNotificationRspBuilder {
+	b.pid = pid
+	return b
+}
+func (b PageFaultNotificationRspBuilder) WithBaseVAddr(v uint64) PageFaultNotificationRspBuilder {
+	b.baseVAddr = v
+	return b
+}
+func (b PageFaultNotificationRspBuilder) WithSize(s uint64) PageFaultNotificationRspBuilder {
+	b.size = s
+	return b
+}
+func (b PageFaultNotificationRspBuilder) WithChanged(c bool) PageFaultNotificationRspBuilder {
+	b.changed = c
+	return b
+}
+
+func (b PageFaultNotificationRspBuilder) WithNewPolicy(p MigrationPolicy) PageFaultNotificationRspBuilder {
+	b.newPolicy = p
+	return b
+}
+
+func (b PageFaultNotificationRspBuilder) Build() *PageFaultNotificationRsp {
+	m := &PageFaultNotificationRsp{PID: b.pid, BaseVAddr: b.baseVAddr, Size: b.size, Changed: b.changed, NewPolicy: b.newPolicy}
+	m.ID = sim.GetIDGenerator().Generate()
+	m.Src, m.Dst, m.SendTime = b.src, b.dst, b.sendTime
+	return m
+}
+
+type MakePageReadOnlyReq struct {
+	sim.MsgMeta
+	PID   PID
+	VAddr uint64
+}
+
+func (r *MakePageReadOnlyReq) Meta() *sim.MsgMeta {
+	return &r.MsgMeta
+}
+
+func NewMakePageReadOnlyReq(
+	time sim.VTimeInSec,
+	src, dst sim.Port,
+) *MakePageReadOnlyReq {
+	cmd := new(MakePageReadOnlyReq)
+	cmd.SendTime = time
+	cmd.Src = src
+	cmd.Dst = dst
+	return cmd
+}
+
+// to invalidate read-only copies of pages when policy is duplication and one processor wants to write
+type InvalidatePageReq struct {
+	sim.MsgMeta
+	VAddr uint64
+	PID   PID
+}
+
+func (r *InvalidatePageReq) Meta() *sim.MsgMeta {
+	return &r.MsgMeta
+}
+
+func NewInvalidatePageReq(
+	time sim.VTimeInSec,
+	src, dst sim.Port,
+) *InvalidatePageReq {
+	cmd := new(InvalidatePageReq)
+	cmd.SendTime = time
+	cmd.Src = src
+	cmd.Dst = dst
+	return cmd
+}
+
+// to update policy after OASIS's object controller decides on a new policy
+type UpdatePolicyReq struct {
+	sim.MsgMeta
+	PID       PID
+	VAddr     uint64
+	NewPolicy MigrationPolicy
+}
+
+func (r *UpdatePolicyReq) Meta() *sim.MsgMeta {
+	return &r.MsgMeta
+}
+
+type UpdatePolicyReqBuilder struct {
+	sendTime  sim.VTimeInSec
+	src, dst  sim.Port
+	pid       PID
+	vAddr     uint64
+	newPolicy MigrationPolicy
+}
+
+func (b UpdatePolicyReqBuilder) WithSendTime(t sim.VTimeInSec) UpdatePolicyReqBuilder {
+	b.sendTime = t
+	return b
+}
+func (b UpdatePolicyReqBuilder) WithSrc(p sim.Port) UpdatePolicyReqBuilder {
+	b.src = p
+	return b
+}
+func (b UpdatePolicyReqBuilder) WithDst(p sim.Port) UpdatePolicyReqBuilder {
+	b.dst = p
+	return b
+}
+func (b UpdatePolicyReqBuilder) WithPID(pid PID) UpdatePolicyReqBuilder {
+	b.pid = pid
+	return b
+}
+func (b UpdatePolicyReqBuilder) WithVAddr(v uint64) UpdatePolicyReqBuilder {
+	b.vAddr = v
+	return b
+}
+
+func (b UpdatePolicyReqBuilder) WithNewPolicy(p MigrationPolicy) UpdatePolicyReqBuilder {
+	b.newPolicy = p
+	return b
+}
+
+func (b UpdatePolicyReqBuilder) Build() *UpdatePolicyReq {
+	m := &UpdatePolicyReq{PID: b.pid, VAddr: b.vAddr, NewPolicy: b.newPolicy}
+	m.ID = sim.GetIDGenerator().Generate()
+	m.Src, m.Dst, m.SendTime = b.src, b.dst, b.sendTime
+	return m
+}
+
+// from address translators to the GMMU
+type UpdateCounterReq struct {
+	sim.MsgMeta
+	VAddr    uint64
+	PID      PID
+	DeviceID uint64
+	Write    bool // specify if translation request is for a read or write
+}
+
+func (r *UpdateCounterReq) Meta() *sim.MsgMeta {
+	return &r.MsgMeta
+}
+
 type UpdateCounterReqBuilder struct {
 	sendTime sim.VTimeInSec
 	src, dst sim.Port
@@ -261,219 +513,4 @@ func (b UpdateCounterReqBuilder) Build() *UpdateCounterReq {
 	r.DeviceID = b.deviceID
 	r.Write = b.write
 	return r
-}
-
-type PageMigrationInfo struct {
-	GPUReqToVAddrMap map[uint64][]uint64
-}
-
-// PageMigrationReqToDriver is a req to driver from MMU to start page migration process
-type PageMigrationReqToDriver struct {
-	sim.MsgMeta
-
-	StartTime         sim.VTimeInSec
-	EndTime           sim.VTimeInSec
-	MigrationInfo     *PageMigrationInfo
-	CurrAccessingGPUs []uint64
-	PID               PID
-	CurrPageHostGPU   uint64
-	PageSize          uint64
-	RespondToTop      bool
-}
-
-// Meta returns the meta data associated with the message.
-func (m *PageMigrationReqToDriver) Meta() *sim.MsgMeta {
-	return &m.MsgMeta
-}
-
-// NewPageMigrationReqToDriver creates a PageMigrationReqToDriver.
-func NewPageMigrationReqToDriver(
-	time sim.VTimeInSec,
-	src, dst sim.Port,
-) *PageMigrationReqToDriver {
-	cmd := new(PageMigrationReqToDriver)
-	cmd.SendTime = time
-	cmd.Src = src
-	cmd.Dst = dst
-	return cmd
-}
-
-// PageMigrationRspFromDriver is a rsp from driver to MMU marking completion of migration
-type PageMigrationRspFromDriver struct {
-	sim.MsgMeta
-
-	StartTime sim.VTimeInSec
-	EndTime   sim.VTimeInSec
-	VAddr     []uint64
-	RspToTop  bool
-}
-
-// Meta returns the meta data associated with the message.
-func (m *PageMigrationRspFromDriver) Meta() *sim.MsgMeta {
-	return &m.MsgMeta
-}
-
-// NewPageMigrationRspFromDriver creates a new PageMigrationRspFromDriver.
-func NewPageMigrationRspFromDriver(
-	time sim.VTimeInSec,
-	src, dst sim.Port,
-) *PageMigrationRspFromDriver {
-	cmd := new(PageMigrationRspFromDriver)
-	cmd.SendTime = time
-	cmd.Src = src
-	cmd.Dst = dst
-	return cmd
-}
-
-// mmu notifies driver of page fault to update otable
-type PageFaultNotification struct {
-	sim.MsgMeta
-	PID   PID
-	VAddr uint64
-	Write bool
-}
-
-type PageFaultNotificationRsp struct {
-	sim.MsgMeta
-	PID       PID
-	BaseVAddr uint64
-	Size      uint64
-	Changed   bool
-	NewPolicy MigrationPolicy
-}
-
-func (m *PageFaultNotification) Meta() *sim.MsgMeta { return &m.MsgMeta }
-
-func (m *PageFaultNotificationRsp) Meta() *sim.MsgMeta { return &m.MsgMeta }
-
-type PageFaultNotificationBuilder struct {
-	sendTime sim.VTimeInSec
-	src, dst sim.Port
-	pid      PID
-	vAddr    uint64
-	write    bool
-}
-
-func (b PageFaultNotificationBuilder) WithSendTime(t sim.VTimeInSec) PageFaultNotificationBuilder {
-	b.sendTime = t
-	return b
-}
-func (b PageFaultNotificationBuilder) WithSrc(p sim.Port) PageFaultNotificationBuilder {
-	b.src = p
-	return b
-}
-func (b PageFaultNotificationBuilder) WithDst(p sim.Port) PageFaultNotificationBuilder {
-	b.dst = p
-	return b
-}
-func (b PageFaultNotificationBuilder) WithPID(pid PID) PageFaultNotificationBuilder {
-	b.pid = pid
-	return b
-}
-func (b PageFaultNotificationBuilder) WithVAddr(v uint64) PageFaultNotificationBuilder {
-	b.vAddr = v
-	return b
-}
-func (b PageFaultNotificationBuilder) WithWrite(w bool) PageFaultNotificationBuilder {
-	b.write = w
-	return b
-}
-
-func (b PageFaultNotificationBuilder) Build() *PageFaultNotification {
-	m := &PageFaultNotification{PID: b.pid, VAddr: b.vAddr, Write: b.write}
-	m.ID = sim.GetIDGenerator().Generate()
-	m.Src, m.Dst, m.SendTime = b.src, b.dst, b.sendTime
-	return m
-}
-
-type PageFaultNotificationRspBuilder struct {
-	sendTime  sim.VTimeInSec
-	src, dst  sim.Port
-	pid       PID
-	baseVAddr uint64
-	size      uint64
-	changed   bool
-	newPolicy MigrationPolicy
-}
-
-func (b PageFaultNotificationRspBuilder) WithSendTime(t sim.VTimeInSec) PageFaultNotificationRspBuilder {
-	b.sendTime = t
-	return b
-}
-func (b PageFaultNotificationRspBuilder) WithSrc(p sim.Port) PageFaultNotificationRspBuilder {
-	b.src = p
-	return b
-}
-func (b PageFaultNotificationRspBuilder) WithDst(p sim.Port) PageFaultNotificationRspBuilder {
-	b.dst = p
-	return b
-}
-func (b PageFaultNotificationRspBuilder) WithPID(pid PID) PageFaultNotificationRspBuilder {
-	b.pid = pid
-	return b
-}
-func (b PageFaultNotificationRspBuilder) WithBaseVAddr(v uint64) PageFaultNotificationRspBuilder {
-	b.baseVAddr = v
-	return b
-}
-func (b PageFaultNotificationRspBuilder) WithSize(s uint64) PageFaultNotificationRspBuilder {
-	b.size = s
-	return b
-}
-func (b PageFaultNotificationRspBuilder) WithChanged(c bool) PageFaultNotificationRspBuilder {
-	b.changed = c
-	return b
-}
-
-func (b PageFaultNotificationRspBuilder) WithNewPolicy(p MigrationPolicy) PageFaultNotificationRspBuilder {
-	b.newPolicy = p
-	return b
-}
-
-func (b PageFaultNotificationRspBuilder) Build() *PageFaultNotificationRsp {
-	m := &PageFaultNotificationRsp{PID: b.pid, BaseVAddr: b.baseVAddr, Size: b.size, Changed: b.changed, NewPolicy: b.newPolicy}
-	m.ID = sim.GetIDGenerator().Generate()
-	m.Src, m.Dst, m.SendTime = b.src, b.dst, b.sendTime
-	return m
-}
-
-type UpdatePolicyReqBuilder struct {
-	sendTime  sim.VTimeInSec
-	src, dst  sim.Port
-	pid       PID
-	vAddr     uint64
-	newPolicy MigrationPolicy
-}
-
-func (b UpdatePolicyReqBuilder) WithSendTime(t sim.VTimeInSec) UpdatePolicyReqBuilder {
-	b.sendTime = t
-	return b
-}
-func (b UpdatePolicyReqBuilder) WithSrc(p sim.Port) UpdatePolicyReqBuilder {
-	b.src = p
-	return b
-}
-func (b UpdatePolicyReqBuilder) WithDst(p sim.Port) UpdatePolicyReqBuilder {
-	b.dst = p
-	return b
-}
-func (b UpdatePolicyReqBuilder) WithPID(pid PID) UpdatePolicyReqBuilder {
-	b.pid = pid
-	return b
-}
-func (b UpdatePolicyReqBuilder) WithVAddr(v uint64) UpdatePolicyReqBuilder {
-	b.vAddr = v
-	return b
-}
-
-func (b UpdatePolicyReqBuilder) WithNewPolicy(p MigrationPolicy) UpdatePolicyReqBuilder {
-	b.newPolicy = p
-	return b
-}
-
-func (b UpdatePolicyReqBuilder) Build() *UpdatePolicyReq {
-	m := &UpdatePolicyReq{PID: b.pid, VAddr: b.vAddr, NewPolicy: b.newPolicy}
-	m.ID = sim.GetIDGenerator().Generate()
-	m.Src, m.Dst, m.SendTime = b.src, b.dst, b.sendTime
-	return m
 }

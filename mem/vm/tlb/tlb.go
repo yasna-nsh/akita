@@ -31,6 +31,15 @@ type TLB struct {
 	respondingMSHREntry *mshrEntry
 
 	isPaused bool
+
+	childPorts            []sim.Port
+	pendingInvalidates    []*vm.InvalidatePageReq
+	pendingMakeReadOnly   []*vm.MakePageReadOnlyReq
+	pendingUpdatePolicies []*vm.UpdatePolicyReq
+}
+
+func (tlb *TLB) SetChildPorts(ports []sim.Port) {
+	tlb.childPorts = ports
 }
 
 // Reset sets all the entries int he TLB to be invalid
@@ -59,6 +68,10 @@ func (tlb *TLB) Tick(now sim.VTimeInSec) bool {
 
 		for i := 0; i < tlb.numReqPerCycle; i++ {
 			madeProgress = tlb.parseBottom(now) || madeProgress
+		}
+
+		for i := 0; i < tlb.numReqPerCycle; i++ {
+			madeProgress = tlb.sendtop(now) || madeProgress
 		}
 	}
 
@@ -110,8 +123,11 @@ func (tlb *TLB) lookup(now sim.VTimeInSec) bool {
 	setID := tlb.vAddrToSetID(req.VAddr)
 	set := tlb.Sets[setID]
 	wayID, page, found := set.Lookup(req.PID, req.VAddr)
-	if found && page.Valid {
+	if found && page.Valid && !(page.MigrationPolicy == vm.PolicyDuplication && page.ReadOnly && req.Write) {
 		return tlb.handleTranslationHit(now, req, setID, wayID, page)
+	}
+	if found && page.Valid && page.MigrationPolicy == vm.PolicyDuplication && page.ReadOnly && req.Write {
+		log.Printf("device %v write, valid & ro page %v, invalidate others", tlb.Name(), page.VAddr)
 	}
 
 	return tlb.handleTranslationMiss(now, req)
@@ -211,6 +227,7 @@ func (tlb *TLB) fetchBottom(now sim.VTimeInSec, req *vm.TranslationReq, mshr boo
 		WithVAddr(req.VAddr).
 		WithDeviceID(req.DeviceID).
 		WithMigrate(req.Migrate).
+		WithWrite(req.Write).
 		Build()
 	err := tlb.bottomPort.Send(fetchBottom)
 	if err != nil {
@@ -235,6 +252,76 @@ func (tlb *TLB) parseBottom(now sim.VTimeInSec) bool {
 	item := tlb.bottomPort.Peek()
 	if item == nil {
 		return false
+	}
+
+	switch item := item.(type) {
+	case *vm.InvalidatePageReq:
+		tlb.bottomPort.Retrieve(now)
+		setID := tlb.vAddrToSetID(item.VAddr)
+		wayID, page, found := tlb.Sets[setID].Lookup(item.PID, item.VAddr)
+		if found {
+			page.Valid = false
+			tlb.Sets[setID].Update(wayID, page)
+			log.Printf("Invalidating page %v in device %v", page.VAddr, tlb.Name())
+			// l2tlb notifies l1tlbs
+			if len(tlb.childPorts) > 0 {
+				for _, dst := range tlb.childPorts {
+					child := vm.NewInvalidatePageReq(now, tlb.topPort, dst)
+					child.PID = item.PID
+					child.VAddr = item.VAddr
+					if e := tlb.topPort.Send(child); e != nil {
+						tlb.pendingInvalidates = append(tlb.pendingInvalidates, child)
+					}
+				}
+			}
+		}
+		return true
+	case *vm.MakePageReadOnlyReq:
+		tlb.bottomPort.Retrieve(now)
+		setID := tlb.vAddrToSetID(item.VAddr)
+		wayID, page, found := tlb.Sets[setID].Lookup(item.PID, item.VAddr)
+		if found {
+			page.ReadOnly = true
+			tlb.Sets[setID].Update(wayID, page)
+			// l2tlb notifies l1tlbs
+			if len(tlb.childPorts) > 0 {
+				for _, dst := range tlb.childPorts {
+					child := vm.NewMakePageReadOnlyReq(now, tlb.topPort, dst)
+					child.PID = item.PID
+					child.VAddr = item.VAddr
+					if e := tlb.topPort.Send(child); e != nil {
+						tlb.pendingMakeReadOnly = append(tlb.pendingMakeReadOnly, child)
+					}
+				}
+			}
+		}
+		return true
+	case *vm.UpdatePolicyReq:
+		tlb.bottomPort.Retrieve(now)
+		setID := tlb.vAddrToSetID(item.VAddr)
+		wayID, page, found := tlb.Sets[setID].Lookup(item.PID, item.VAddr)
+		if found {
+			page.MigrationPolicy = item.NewPolicy
+			tlb.Sets[setID].Update(wayID, page)
+		}
+		// l2tlb notifies l1tlbs
+		if len(tlb.childPorts) > 0 {
+			for _, dst := range tlb.childPorts {
+				child := vm.UpdatePolicyReqBuilder{}.
+					WithSendTime(now).
+					WithSrc(tlb.topPort).
+					WithDst(dst).
+					WithPID(item.PID).
+					WithVAddr(item.VAddr).
+					WithNewPolicy(item.NewPolicy).
+					Build()
+				if e := tlb.topPort.Send(child); e != nil {
+					tlb.pendingUpdatePolicies = append(tlb.pendingUpdatePolicies, child)
+				}
+			}
+		}
+		return true
+
 	}
 
 	rsp := item.(*vm.TranslationRsp)
@@ -343,4 +430,37 @@ func (tlb *TLB) handleTLBRestart(now sim.VTimeInSec, req *RestartReq) bool {
 	}
 
 	return true
+}
+
+func (tlb *TLB) sendtop(now sim.VTimeInSec) bool {
+	progress := false
+	if len(tlb.pendingInvalidates) != 0 {
+		req := tlb.pendingInvalidates[0]
+		req.SendTime = now
+		err := tlb.topPort.Send(req)
+		if err == nil {
+			progress = true
+		}
+		tlb.pendingInvalidates = tlb.pendingInvalidates[1:]
+	}
+	if len(tlb.pendingMakeReadOnly) != 0 {
+		req := tlb.pendingMakeReadOnly[0]
+		req.SendTime = now
+		err := tlb.topPort.Send(req)
+		if err == nil {
+			progress = true
+		}
+		tlb.pendingMakeReadOnly = tlb.pendingMakeReadOnly[1:]
+	}
+	if len(tlb.pendingUpdatePolicies) != 0 {
+		req := tlb.pendingUpdatePolicies[0]
+		req.SendTime = now
+		err := tlb.topPort.Send(req)
+		if err == nil {
+			progress = true
+		}
+		tlb.pendingUpdatePolicies = tlb.pendingUpdatePolicies[1:]
+	}
+
+	return progress
 }

@@ -44,6 +44,11 @@ type Comp struct {
 	ToAT                    sim.Port
 	remainingAccesses       map[uint64]int
 	pendingForcedMigrations map[uint64]vm.PID
+
+	l2TLBTopDst             sim.Port
+	pendingInvalidateReqs   []*vm.InvalidatePageReq
+	pendingMakeReadOnlyReqs []*vm.MakePageReadOnlyReq
+	pendingUpdatePolicies   []*vm.UpdatePolicyReq
 }
 
 // Tick defines how the gmmu update state each cycle
@@ -55,8 +60,15 @@ func (gmmu *Comp) Tick(now sim.VTimeInSec) bool {
 	madeProgress = gmmu.walkPageTable(now) || madeProgress
 	madeProgress = gmmu.fetchFromBottom(now) || madeProgress
 	madeProgress = gmmu.fetchFromAT(now) || madeProgress
+	madeProgress = gmmu.handleInvalidatePageReq(now) || madeProgress
+	madeProgress = gmmu.handleMakePageReadOnlyReq(now) || madeProgress
+	madeProgress = gmmu.handleUpdatePolicyReq(now) || madeProgress
 
 	return madeProgress
+}
+
+func (gmmu *Comp) SetL2TLBTopDst(p sim.Port) {
+	gmmu.l2TLBTopDst = p
 }
 
 func (gmmu *Comp) parseFromTop(now sim.VTimeInSec) bool {
@@ -127,6 +139,9 @@ func (gmmu *Comp) walkPageTable(now sim.VTimeInSec) bool {
 
 // canServeLocally decides whether we should go back to the MMU or not
 func (gmmu *Comp) canServeLocally(page vm.Page, req *vm.TranslationReq) bool {
+	if page.MigrationPolicy == vm.PolicyDuplication && req.Write && page.ReadOnly {
+		return false
+	}
 	if page.DeviceID == gmmu.deviceID {
 		return true
 	}
@@ -141,8 +156,9 @@ func (gmmu *Comp) canServeLocally(page vm.Page, req *vm.TranslationReq) bool {
 		return !gmmu.accessCounterExpired(page.VAddr)
 
 	case vm.PolicyDuplication:
+		log.Printf("shouldn't be here page.DID %v, GMMU.DID %v, RO %v\n", page.DeviceID, gmmu.deviceID, page.ReadOnly)
 		// if read, answer localy from read-only copy
-		return !req.Write
+		return !req.Write || !page.ReadOnly
 
 	default: // on touch or other policy: always send to MMU
 		return false
@@ -161,7 +177,6 @@ func (gmmu *Comp) accessCounterExpired(vAddr uint64) bool {
 		return false
 	}
 
-	remaining--
 	if remaining < 0 {
 		delete(gmmu.remainingAccesses, vAddr)
 		return true
@@ -268,15 +283,27 @@ func (gmmu *Comp) fetchFromBottom(now sim.VTimeInSec) bool {
 	switch req := req.(type) {
 	case *vm.TranslationRsp:
 		return gmmu.handleTranslationRsp(now, req)
+
 	case *vm.InvalidatePageReq:
 		page, found := gmmu.pageTable.Find(req.PID, req.VAddr)
 		if found {
 			page.Valid = false
 			gmmu.pageTable.Update(page)
 		}
-		return gmmu.handleInvalidatePageReq(now, req)
+		gmmu.pendingInvalidateReqs = append(gmmu.pendingInvalidateReqs, req)
+
 	case *vm.UpdatePolicyReq:
-		return gmmu.UpdatePagePolicy(req)
+		gmmu.UpdatePagePolicy(req)
+		gmmu.pendingUpdatePolicies = append(gmmu.pendingUpdatePolicies, req)
+
+	case *vm.MakePageReadOnlyReq:
+		page, found := gmmu.pageTable.Find(req.PID, req.VAddr)
+		if found {
+			page.ReadOnly = true
+			gmmu.pageTable.Update(page)
+		}
+		gmmu.pendingMakeReadOnlyReqs = append(gmmu.pendingMakeReadOnlyReqs, req)
+
 	default:
 		log.Panicf("gmmu canot handle request of type %s", reflect.TypeOf(req))
 	}
@@ -284,13 +311,12 @@ func (gmmu *Comp) fetchFromBottom(now sim.VTimeInSec) bool {
 	return true
 }
 
-func (gmmu *Comp) UpdatePagePolicy(req *vm.UpdatePolicyReq) bool {
+func (gmmu *Comp) UpdatePagePolicy(req *vm.UpdatePolicyReq) {
 	page, find := gmmu.pageTable.Find(req.PID, req.VAddr)
 	if find {
 		page.MigrationPolicy = req.NewPolicy
 		gmmu.pageTable.Update(page)
 	}
-	return true
 }
 
 func (gmmu *Comp) fetchFromAT(now sim.VTimeInSec) bool {
@@ -318,6 +344,9 @@ func (gmmu *Comp) handleTranslationRsp(now sim.VTimeInSec, rsponse *vm.Translati
 	}
 
 	reqTransaction := gmmu.remoteMemReqs[rsponse.RespondTo]
+	if rsponse.Page.MigrationPolicy == vm.PolicyDuplication {
+		rsponse.Page.DeviceID = gmmu.deviceID
+	}
 	if _, found := gmmu.pageTable.Find(rsponse.Page.PID, rsponse.Page.VAddr); found {
 		gmmu.pageTable.Update(rsponse.Page)
 	} else {
@@ -358,8 +387,56 @@ func (gmmu *Comp) cachePage(page vm.Page) {
 	delete(gmmu.remainingAccesses, page.VAddr)
 }
 
-func (gmmu *Comp) handleInvalidatePageReq(now sim.VTimeInSec, rsponse *vm.InvalidatePageReq) bool {
-	// TODO: invalidate page in tlbs and l0
+func (gmmu *Comp) handleUpdatePolicyReq(now sim.VTimeInSec) bool {
+	if len(gmmu.pendingUpdatePolicies) == 0 {
+		return false
+	}
+	rsponse := gmmu.pendingUpdatePolicies[0]
+	req := vm.UpdatePolicyReqBuilder{}.
+		WithSendTime(now).
+		WithSrc(gmmu.topPort).
+		WithDst(gmmu.l2TLBTopDst).
+		WithPID(rsponse.PID).
+		WithVAddr(rsponse.VAddr).
+		WithNewPolicy(rsponse.NewPolicy).
+		Build()
+	e := gmmu.topPort.Send(req)
+	if e != nil {
+		return false
+	}
+	gmmu.pendingUpdatePolicies = gmmu.pendingUpdatePolicies[1:]
+	return true
+}
+
+func (gmmu *Comp) handleInvalidatePageReq(now sim.VTimeInSec) bool {
+	if len(gmmu.pendingInvalidateReqs) == 0 {
+		return false
+	}
+	rsponse := gmmu.pendingInvalidateReqs[0]
+	req := vm.NewInvalidatePageReq(now, gmmu.topPort, gmmu.l2TLBTopDst)
+	req.PID = rsponse.PID
+	req.VAddr = rsponse.VAddr
+	e := gmmu.topPort.Send(req)
+	if e != nil {
+		return false
+	}
+	gmmu.pendingInvalidateReqs = gmmu.pendingInvalidateReqs[1:]
+	return true
+}
+
+func (gmmu *Comp) handleMakePageReadOnlyReq(now sim.VTimeInSec) bool {
+	if len(gmmu.pendingMakeReadOnlyReqs) == 0 {
+		return false
+	}
+	rsponse := gmmu.pendingMakeReadOnlyReqs[0]
+	req := vm.NewMakePageReadOnlyReq(now, gmmu.topPort, gmmu.l2TLBTopDst)
+	req.PID = rsponse.PID
+	req.VAddr = rsponse.VAddr
+	e := gmmu.topPort.Send(req)
+	if e != nil {
+		return false
+	}
+	gmmu.pendingMakeReadOnlyReqs = gmmu.pendingMakeReadOnlyReqs[1:]
 	return true
 }
 

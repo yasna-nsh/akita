@@ -3,6 +3,7 @@ package mmu
 import (
 	"log"
 	"reflect"
+	"slices"
 
 	"github.com/sarchlab/akita/v3/mem/vm"
 	"github.com/sarchlab/akita/v3/sim"
@@ -48,6 +49,10 @@ type MMU struct {
 
 	toGMMUs   sim.Port
 	GMMUPorts map[uint64]sim.Port
+
+	ROCopies           map[uint64][]uint64 // vaddr -> list of GPUs with copy of page
+	invalidatePageReqs []*vm.InvalidatePageReq
+	makePageROReqs     []*vm.MakePageReadOnlyReq
 }
 
 // Tick defines how the MMU update state each cycle
@@ -61,6 +66,7 @@ func (mmu *MMU) Tick(now sim.VTimeInSec) bool {
 	madeProgress = mmu.parseFromTop(now) || madeProgress
 	madeProgress = mmu.sendPageFaultNotifications(now) || madeProgress
 	madeProgress = mmu.receivePageFaultRsps(now) || madeProgress
+	madeProgress = mmu.retryDupReqs(now) || madeProgress
 
 	return madeProgress
 }
@@ -195,7 +201,7 @@ func (mmu *MMU) addTransactionToMigrationQueue(walkingIndex int) bool {
 func (mmu *MMU) pageNeedMigrate(walking transaction) bool {
 	page := walking.page
 
-	if walking.req.DeviceID == page.DeviceID {
+	if page.MigrationPolicy != vm.PolicyDuplication && walking.req.DeviceID == page.DeviceID {
 		return false
 	}
 
@@ -220,7 +226,7 @@ func (mmu *MMU) pageNeedMigrate(walking transaction) bool {
 		return mmu.checkAccessCounter(walking.req)
 
 	case vm.PolicyDuplication:
-		return mmu.checkDuplication(walking)
+		return true
 
 	default:
 		return true // unset/zero value = on-touch, safe fallback
@@ -230,10 +236,6 @@ func (mmu *MMU) pageNeedMigrate(walking transaction) bool {
 func (mmu *MMU) checkAccessCounter(req *vm.TranslationReq) bool {
 	log.Printf("[access counter] vaddr=%v migrate=%v\n", req.VAddr, req.Migrate)
 	return req.Migrate // migrate page if gpu requested to
-}
-
-func (mmu *MMU) checkDuplication(walking transaction) bool {
-	return true
 }
 
 func (mmu *MMU) doPageWalkHit(
@@ -261,6 +263,93 @@ func (mmu *MMU) doPageWalkHit(
 	return true
 }
 
+// duplication reads and writes
+//   - read:  hand out an additional copy. Nobody's existing copy becomes
+//     stale, so no shootdown is needed, and page.DeviceID (the true
+//     owner) does not change.
+//   - write: every existing read-only copy becomes stale and must be
+//     invalidated before the writer can proceed; ownership
+//     then transfers to the writer, same as an ordinary migration.
+func (mmu *MMU) sendDuplicationMigrationToDriver(
+	now sim.VTimeInSec,
+	trans transaction,
+	page vm.Page,
+) bool {
+	if mmu.isDoingMigration {
+		return false
+	}
+
+	req := trans.req
+
+	migrationInfo := new(vm.PageMigrationInfo)
+	migrationInfo.GPUReqToVAddrMap = make(map[uint64][]uint64)
+	migrationInfo.GPUReqToVAddrMap[req.DeviceID] =
+		append(migrationInfo.GPUReqToVAddrMap[req.DeviceID], req.VAddr)
+
+	migrationReq := vm.NewPageMigrationReqToDriver(
+		now, mmu.migrationPort, mmu.MigrationServiceProvider)
+	migrationReq.PID = page.PID
+	migrationReq.PageSize = page.PageSize
+	migrationReq.CurrPageHostGPU = page.DeviceID
+	migrationReq.MigrationInfo = migrationInfo
+	migrationReq.RespondToTop = true
+	migrationReq.IsDuplication = true
+	migrationReq.Write = req.Write
+
+	if len(mmu.ROCopies[page.VAddr]) == 0 {
+		mmu.ROCopies[page.VAddr] = append(mmu.ROCopies[page.VAddr], page.DeviceID)
+	}
+	migrationReq.CurrAccessingGPUs = unique(append(mmu.ROCopies[page.VAddr], req.DeviceID))
+	log.Printf("handling duplication write[%v], vaddr[%v], curraccessinggpus[%v]\n", req.Write, page.VAddr, migrationReq.CurrAccessingGPUs)
+
+	err := mmu.migrationPort.Send(migrationReq)
+	if err != nil {
+		log.Printf("cannot send req")
+		return false
+	}
+
+	if req.Write {
+		trans.page.IsMigrating = true
+		trans.page.ReadOnly = false
+		trans.page.DeviceID = req.DeviceID
+		mmu.pageTable.Update(trans.page)
+	} else if len(mmu.ROCopies[page.VAddr]) == 1 {
+		// tell the single owner that the page is read only now
+		trans.page.ReadOnly = true
+		mmu.pageTable.Update(trans.page)
+		owner := mmu.ROCopies[page.VAddr][0]
+		req := vm.NewMakePageReadOnlyReq(now, mmu.toGMMUs, mmu.GMMUPorts[owner])
+		req.PID = page.PID
+		req.VAddr = page.VAddr
+		e := mmu.toGMMUs.Send(req)
+		if e != nil {
+			mmu.makePageROReqs = append(mmu.makePageROReqs, req)
+		}
+	}
+
+	trans.migration = migrationReq
+	mmu.isDoingMigration = true
+	mmu.currentOnDemandMigration = trans
+	mmu.migrationQueue = mmu.migrationQueue[1:]
+
+	if req.Write {
+		for _, gpu := range mmu.ROCopies[page.VAddr] {
+			req := vm.NewInvalidatePageReq(now, mmu.toGMMUs, mmu.GMMUPorts[gpu])
+			req.PID = page.PID
+			req.VAddr = page.VAddr
+			e := mmu.toGMMUs.Send(req)
+			if e != nil {
+				mmu.invalidatePageReqs = append(mmu.invalidatePageReqs, req)
+			}
+		}
+		delete(mmu.ROCopies, page.VAddr)
+	} else {
+		mmu.ROCopies[page.VAddr] = unique(append(mmu.ROCopies[page.VAddr], req.DeviceID))
+	}
+
+	return true
+}
+
 func (mmu *MMU) sendMigrationToDriver(
 	now sim.VTimeInSec,
 ) (madeProgress bool) {
@@ -276,7 +365,9 @@ func (mmu *MMU) sendMigrationToDriver(
 	}
 	trans.page = page
 
-	if req.DeviceID == page.DeviceID || page.IsPinned {
+	if (page.MigrationPolicy == vm.PolicyDuplication && !req.Write && slices.Contains(mmu.ROCopies[page.VAddr], req.DeviceID)) || // duplication read repeat send to mmu (shouldn't happen)
+		(req.DeviceID == page.DeviceID && !(page.MigrationPolicy == vm.PolicyDuplication && req.Write)) || // page on the device, not duplication write
+		page.IsPinned {
 		mmu.sendTranlationRsp(now, trans)
 		mmu.migrationQueue = mmu.migrationQueue[1:]
 		mmu.markPageAsNotMigratingIfNotInTheMigrationQueue(page)
@@ -286,6 +377,10 @@ func (mmu *MMU) sendMigrationToDriver(
 
 	if mmu.isDoingMigration {
 		return false
+	}
+
+	if page.MigrationPolicy == vm.PolicyDuplication {
+		return mmu.sendDuplicationMigrationToDriver(now, trans, page)
 	}
 
 	migrationInfo := new(vm.PageMigrationInfo)
@@ -370,10 +465,22 @@ func (mmu *MMU) processMigrationReturn(now sim.VTimeInSec) bool {
 		return false
 	}
 
+	rspFromDriver := item.(*vm.PageMigrationRspFromDriver)
+
 	req := mmu.currentOnDemandMigration.req
-	page, found := mmu.pageTable.Find(req.PID, req.VAddr)
-	if !found {
-		panic("page not found")
+	migReq := mmu.currentOnDemandMigration.migration
+
+	var page vm.Page
+	if migReq.IsDuplication && !migReq.Write {
+		// Duplication read: translation we hand back to the requester
+		// has to point at the copy's own local physical address.
+		page = *rspFromDriver.CopyPage
+	} else {
+		var found bool
+		page, found = mmu.pageTable.Find(req.PID, req.VAddr)
+		if !found {
+			panic("page not found")
+		}
 	}
 
 	rsp := vm.TranslationRspBuilder{}.
@@ -387,9 +494,10 @@ func (mmu *MMU) processMigrationReturn(now sim.VTimeInSec) bool {
 
 	mmu.isDoingMigration = false
 
-	page = mmu.markPageAsNotMigratingIfNotInTheMigrationQueue(page)
-	// page.IsPinned = true
-	mmu.pageTable.Update(page)
+	if !(migReq.IsDuplication && !migReq.Write) {
+		page = mmu.markPageAsNotMigratingIfNotInTheMigrationQueue(page)
+		mmu.pageTable.Update(page)
+	}
 
 	mmu.migrationPort.Retrieve(now)
 
@@ -447,4 +555,38 @@ func unique(intSlice []uint64) []uint64 {
 		}
 	}
 	return list
+}
+
+func (mmu *MMU) retryDupReqs(now sim.VTimeInSec) bool {
+	prog := false
+	if len(mmu.invalidatePageReqs) != 0 {
+		dst := mmu.invalidatePageReqs[:0]
+
+		for _, req := range mmu.invalidatePageReqs {
+			req.SendTime = now
+			err := mmu.toGMMUs.Send(req)
+			if err != nil {
+				dst = append(dst, req)
+			} else {
+				prog = true
+			}
+		}
+		mmu.invalidatePageReqs = dst
+	}
+	if len(mmu.makePageROReqs) != 0 {
+		dst := mmu.makePageROReqs[:0]
+
+		for _, req := range mmu.makePageROReqs {
+			req.SendTime = now
+			err := mmu.toGMMUs.Send(req)
+			if err != nil {
+				dst = append(dst, req)
+			} else {
+				prog = true
+			}
+		}
+		mmu.makePageROReqs = dst
+	}
+
+	return prog
 }

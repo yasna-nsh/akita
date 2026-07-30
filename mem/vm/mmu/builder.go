@@ -101,7 +101,7 @@ func (b Builder) Build(name string) *MMU {
 	mmu.migrationPolicy = b.migrationPolicy
 	mmu.useOASIS = b.useOASIS
 	mmu.pendingPageFaults = make([]*vm.PageFaultNotification, 0)
-
+	mmu.ROCopies = make(map[uint64][]uint64)
 	return mmu
 }
 
@@ -125,9 +125,9 @@ func (b Builder) createPageTable(mmu *MMU) {
 func (b Builder) createPorts(name string, mmu *MMU) {
 	mmu.topPort = sim.NewLimitNumMsgPort(mmu, 4096, name+".ToTop")
 	mmu.AddPort("Top", mmu.topPort)
-	mmu.migrationPort = sim.NewLimitNumMsgPort(mmu, 1, name+".MigrationPort")
+	mmu.migrationPort = sim.NewLimitNumMsgPort(mmu, 16, name+".MigrationPort")
 	mmu.AddPort("Migration", mmu.migrationPort)
-	mmu.pageFaultPort = sim.NewLimitNumMsgPort(mmu, 1, name+".PageFaultPort")
+	mmu.pageFaultPort = sim.NewLimitNumMsgPort(mmu, 16, name+".PageFaultPort")
 	mmu.AddPort("PageFault", mmu.pageFaultPort)
 	mmu.toGMMUs = sim.NewLimitNumMsgPort(mmu, 16, name+".ToGMMUs")
 	mmu.AddPort("ToGMMUs", mmu.toGMMUs)
