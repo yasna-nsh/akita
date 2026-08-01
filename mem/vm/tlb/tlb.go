@@ -36,6 +36,7 @@ type TLB struct {
 	pendingInvalidates    []*vm.InvalidatePageReq
 	pendingMakeReadOnly   []*vm.MakePageReadOnlyReq
 	pendingUpdatePolicies []*vm.UpdatePolicyReq
+	pendingUpdateDIDs     []*vm.UpdateDIDReq
 }
 
 func (tlb *TLB) SetChildPorts(ports []sim.Port) {
@@ -125,9 +126,6 @@ func (tlb *TLB) lookup(now sim.VTimeInSec) bool {
 	wayID, page, found := set.Lookup(req.PID, req.VAddr)
 	if found && page.Valid && !(page.MigrationPolicy == vm.PolicyDuplication && page.ReadOnly && req.Write) {
 		return tlb.handleTranslationHit(now, req, setID, wayID, page)
-	}
-	if found && page.Valid && page.MigrationPolicy == vm.PolicyDuplication && page.ReadOnly && req.Write {
-		log.Printf("device %v write, valid & ro page %v, invalidate others", tlb.Name(), page.VAddr)
 	}
 
 	return tlb.handleTranslationMiss(now, req)
@@ -262,7 +260,6 @@ func (tlb *TLB) parseBottom(now sim.VTimeInSec) bool {
 		if found {
 			page.Valid = false
 			tlb.Sets[setID].Update(wayID, page)
-			log.Printf("Invalidating page %v in device %v", page.VAddr, tlb.Name())
 			// l2tlb notifies l1tlbs
 			if len(tlb.childPorts) > 0 {
 				for _, dst := range tlb.childPorts {
@@ -321,7 +318,27 @@ func (tlb *TLB) parseBottom(now sim.VTimeInSec) bool {
 			}
 		}
 		return true
-
+	case *vm.UpdateDIDReq:
+		tlb.bottomPort.Retrieve(now)
+		setID := tlb.vAddrToSetID(item.VAddr)
+		wayID, page, found := tlb.Sets[setID].Lookup(item.PID, item.VAddr)
+		if found {
+			page.DeviceID = item.DeviceID
+			tlb.Sets[setID].Update(wayID, page)
+		}
+		// l2tlb notifies l1tlbs
+		if len(tlb.childPorts) > 0 {
+			for _, dst := range tlb.childPorts {
+				child := vm.NewUpdateDIDReq(now, tlb.topPort, dst)
+				child.PID = item.PID
+				child.VAddr = item.VAddr
+				child.DeviceID = item.DeviceID
+				if e := tlb.topPort.Send(child); e != nil {
+					tlb.pendingUpdateDIDs = append(tlb.pendingUpdateDIDs, child)
+				}
+			}
+		}
+		return true
 	}
 
 	rsp := item.(*vm.TranslationRsp)
@@ -460,6 +477,15 @@ func (tlb *TLB) sendtop(now sim.VTimeInSec) bool {
 			progress = true
 		}
 		tlb.pendingUpdatePolicies = tlb.pendingUpdatePolicies[1:]
+	}
+	if len(tlb.pendingUpdateDIDs) != 0 {
+		req := tlb.pendingUpdateDIDs[0]
+		req.SendTime = now
+		err := tlb.topPort.Send(req)
+		if err == nil {
+			progress = true
+		}
+		tlb.pendingUpdateDIDs = tlb.pendingUpdateDIDs[1:]
 	}
 
 	return progress

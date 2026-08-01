@@ -100,8 +100,8 @@ func (b Builder) Build(name string) *MMU {
 	b.configureInternalStates(mmu)
 	mmu.migrationPolicy = b.migrationPolicy
 	mmu.useOASIS = b.useOASIS
-	mmu.pendingPageFaults = make([]*vm.PageFaultNotification, 0)
 	mmu.ROCopies = make(map[uint64][]uint64)
+	mmu.PageFaultCount = make([]uint64, 4)
 	return mmu
 }
 

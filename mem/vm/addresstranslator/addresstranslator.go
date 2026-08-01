@@ -318,7 +318,7 @@ func (t *AddressTranslator) respond(now sim.VTimeInSec) bool {
 			Build()
 		gl0InvalidateRsp = true
 	case *vm.InvalidatePageReq:
-		log.Printf("invalidate page %v reached AT\n", rsp.VAddr)
+		// log.Printf("invalidate page %v reached AT\n", rsp.VAddr)
 	default:
 		log.Panicf("cannot handle respond of type %s", reflect.TypeOf(rsp))
 	}

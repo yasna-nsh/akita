@@ -53,6 +53,9 @@ type MMU struct {
 	ROCopies           map[uint64][]uint64 // vaddr -> list of GPUs with copy of page
 	invalidatePageReqs []*vm.InvalidatePageReq
 	makePageROReqs     []*vm.MakePageReadOnlyReq
+	updatePolicyReqs   []*vm.UpdatePolicyReq
+
+	PageFaultCount []uint64
 }
 
 // Tick defines how the MMU update state each cycle
@@ -120,6 +123,8 @@ func (mmu *MMU) finalizePageWalk(
 }
 
 func (mmu *MMU) notifyPageFault(page vm.Page, req *vm.TranslationReq) {
+	mmu.PageFaultCount[req.DeviceID]++
+	log.Printf("[page fault counts per device] %v", mmu.PageFaultCount)
 	notif := vm.PageFaultNotificationBuilder{}.
 		WithSendTime(0). // set at actual send time below
 		WithSrc(mmu.pageFaultPort).
@@ -156,22 +161,39 @@ func (mmu *MMU) receivePageFaultRsps(now sim.VTimeInSec) bool {
 		for vaddr := res.BaseVAddr; vaddr < res.BaseVAddr+res.Size; {
 			page, found := mmu.pageTable.Find(res.PID, vaddr)
 			if found {
-				// update policy in mmu
-				page.MigrationPolicy = res.NewPolicy
-				mmu.pageTable.Update(page)
-				// notify gmmu of page's owner to update policy
-				port := mmu.GMMUPorts[page.DeviceID]
-				req := vm.UpdatePolicyReqBuilder{}.
-					WithSendTime(now).
-					WithSrc(mmu.toGMMUs).
-					WithDst(port).
-					WithPID(res.PID).
-					WithVAddr(vaddr).
-					WithNewPolicy(res.NewPolicy).
-					Build()
-				e := port.Send(req)
-				if e != nil {
-					log.Panicln("Couldn't notify GMMUs of change in policy.")
+				if !(page.MigrationPolicy == vm.PolicyDuplication && len(mmu.ROCopies[vaddr]) > 1) {
+					// update policy in mmu if previous policy isn't duplication or only one gpu has it
+					page.MigrationPolicy = res.NewPolicy
+					mmu.pageTable.Update(page)
+					// notify gmmu of page's owner to update policy
+					port := mmu.GMMUPorts[page.DeviceID-1]
+					req := vm.UpdatePolicyReqBuilder{}.
+						WithSendTime(now).
+						WithSrc(mmu.toGMMUs).
+						WithDst(port).
+						WithPID(res.PID).
+						WithVAddr(vaddr).
+						WithNewPolicy(res.NewPolicy).
+						Build()
+					e := mmu.toGMMUs.Send(req)
+					if e != nil {
+						mmu.updatePolicyReqs = append(mmu.updatePolicyReqs, req)
+					}
+				} else {
+					// invaliate page in gpus otherwirse
+					page.MigrationPolicy = res.NewPolicy
+					mmu.pageTable.Update(page)
+					for _, gpu := range mmu.ROCopies[vaddr] {
+						port := mmu.GMMUPorts[gpu-1]
+						req := vm.NewInvalidatePageReq(now, mmu.toGMMUs, port)
+						req.PID = res.PID
+						req.VAddr = vaddr
+						e := mmu.toGMMUs.Send(req)
+						if e != nil {
+							mmu.invalidatePageReqs = append(mmu.invalidatePageReqs, req)
+						}
+					}
+					delete(mmu.ROCopies, vaddr)
 				}
 				vaddr += page.PageSize
 			} else {
@@ -223,7 +245,7 @@ func (mmu *MMU) pageNeedMigrate(walking transaction) bool {
 		return true
 
 	case vm.PolicyAccessCounter:
-		return mmu.checkAccessCounter(walking.req)
+		return walking.req.Migrate
 
 	case vm.PolicyDuplication:
 		return true
@@ -231,11 +253,6 @@ func (mmu *MMU) pageNeedMigrate(walking transaction) bool {
 	default:
 		return true // unset/zero value = on-touch, safe fallback
 	}
-}
-
-func (mmu *MMU) checkAccessCounter(req *vm.TranslationReq) bool {
-	log.Printf("[access counter] vaddr=%v migrate=%v\n", req.VAddr, req.Migrate)
-	return req.Migrate // migrate page if gpu requested to
 }
 
 func (mmu *MMU) doPageWalkHit(
@@ -300,11 +317,10 @@ func (mmu *MMU) sendDuplicationMigrationToDriver(
 		mmu.ROCopies[page.VAddr] = append(mmu.ROCopies[page.VAddr], page.DeviceID)
 	}
 	migrationReq.CurrAccessingGPUs = unique(append(mmu.ROCopies[page.VAddr], req.DeviceID))
-	log.Printf("handling duplication write[%v], vaddr[%v], curraccessinggpus[%v]\n", req.Write, page.VAddr, migrationReq.CurrAccessingGPUs)
+	// log.Printf("handling duplication write[%v], vaddr[%v], curraccessinggpus[%v]\n", req.Write, page.VAddr, migrationReq.CurrAccessingGPUs)
 
 	err := mmu.migrationPort.Send(migrationReq)
 	if err != nil {
-		log.Printf("cannot send req")
 		return false
 	}
 
@@ -334,7 +350,11 @@ func (mmu *MMU) sendDuplicationMigrationToDriver(
 
 	if req.Write {
 		for _, gpu := range mmu.ROCopies[page.VAddr] {
-			req := vm.NewInvalidatePageReq(now, mmu.toGMMUs, mmu.GMMUPorts[gpu])
+			if gpu == req.DeviceID {
+				continue
+			}
+			log.Printf("write req, invaling gpu %v", gpu)
+			req := vm.NewInvalidatePageReq(now, mmu.toGMMUs, mmu.GMMUPorts[gpu-1])
 			req.PID = page.PID
 			req.VAddr = page.VAddr
 			e := mmu.toGMMUs.Send(req)
@@ -342,7 +362,8 @@ func (mmu *MMU) sendDuplicationMigrationToDriver(
 				mmu.invalidatePageReqs = append(mmu.invalidatePageReqs, req)
 			}
 		}
-		delete(mmu.ROCopies, page.VAddr)
+		log.Printf("done with write, req %v from %v", req.ID, req.DeviceID)
+		mmu.ROCopies[page.VAddr] = []uint64{req.DeviceID}
 	} else {
 		mmu.ROCopies[page.VAddr] = unique(append(mmu.ROCopies[page.VAddr], req.DeviceID))
 	}
@@ -586,6 +607,20 @@ func (mmu *MMU) retryDupReqs(now sim.VTimeInSec) bool {
 			}
 		}
 		mmu.makePageROReqs = dst
+	}
+	if len(mmu.updatePolicyReqs) != 0 {
+		dst := mmu.updatePolicyReqs[:0]
+
+		for _, req := range mmu.updatePolicyReqs {
+			req.SendTime = now
+			err := mmu.toGMMUs.Send(req)
+			if err != nil {
+				dst = append(dst, req)
+			} else {
+				prog = true
+			}
+		}
+		mmu.updatePolicyReqs = dst
 	}
 
 	return prog

@@ -514,3 +514,25 @@ func (b UpdateCounterReqBuilder) Build() *UpdateCounterReq {
 	r.Write = b.write
 	return r
 }
+
+type UpdateDIDReq struct {
+	sim.MsgMeta
+	VAddr    uint64
+	PID      PID
+	DeviceID uint64
+}
+
+func (r *UpdateDIDReq) Meta() *sim.MsgMeta {
+	return &r.MsgMeta
+}
+
+func NewUpdateDIDReq(
+	time sim.VTimeInSec,
+	src, dst sim.Port,
+) *UpdateDIDReq {
+	cmd := new(UpdateDIDReq)
+	cmd.SendTime = time
+	cmd.Src = src
+	cmd.Dst = dst
+	return cmd
+}

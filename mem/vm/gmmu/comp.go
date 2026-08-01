@@ -45,10 +45,12 @@ type Comp struct {
 	remainingAccesses       map[uint64]int
 	pendingForcedMigrations map[uint64]vm.PID
 
-	l2TLBTopDst             sim.Port
-	pendingInvalidateReqs   []*vm.InvalidatePageReq
-	pendingMakeReadOnlyReqs []*vm.MakePageReadOnlyReq
-	pendingUpdatePolicies   []*vm.UpdatePolicyReq
+	l2TLBTopDst                sim.Port
+	pendingInvalidateReqs      []*vm.InvalidatePageReq
+	pendingMakeReadOnlyReqs    []*vm.MakePageReadOnlyReq
+	pendingUpdatePolicies      []*vm.UpdatePolicyReq
+	pendingForcedMigrationReqs []*vm.TranslationReq
+	pendingUpdateDIDReqs       []*vm.UpdateDIDReq
 }
 
 // Tick defines how the gmmu update state each cycle
@@ -63,6 +65,8 @@ func (gmmu *Comp) Tick(now sim.VTimeInSec) bool {
 	madeProgress = gmmu.handleInvalidatePageReq(now) || madeProgress
 	madeProgress = gmmu.handleMakePageReadOnlyReq(now) || madeProgress
 	madeProgress = gmmu.handleUpdatePolicyReq(now) || madeProgress
+	madeProgress = gmmu.handleForcedMigrations(now) || madeProgress
+	madeProgress = gmmu.handleUpdateDIDReqs(now) || madeProgress
 
 	return madeProgress
 }
@@ -156,7 +160,6 @@ func (gmmu *Comp) canServeLocally(page vm.Page, req *vm.TranslationReq) bool {
 		return !gmmu.accessCounterExpired(page.VAddr)
 
 	case vm.PolicyDuplication:
-		log.Printf("shouldn't be here page.DID %v, GMMU.DID %v, RO %v\n", page.DeviceID, gmmu.deviceID, page.ReadOnly)
 		// if read, answer localy from read-only copy
 		return !req.Write || !page.ReadOnly
 
@@ -289,6 +292,9 @@ func (gmmu *Comp) fetchFromBottom(now sim.VTimeInSec) bool {
 		if found {
 			page.Valid = false
 			gmmu.pageTable.Update(page)
+			// log.Printf("Invalidating page %v in gpu %v after policy change.", req.VAddr, gmmu.Name())
+		} else {
+			log.Printf("Inconsistency betweem mmu and gmmu's pt, page %v isn't in gpu %v", req.VAddr, gmmu.Name())
 		}
 		gmmu.pendingInvalidateReqs = append(gmmu.pendingInvalidateReqs, req)
 
@@ -314,6 +320,7 @@ func (gmmu *Comp) fetchFromBottom(now sim.VTimeInSec) bool {
 func (gmmu *Comp) UpdatePagePolicy(req *vm.UpdatePolicyReq) {
 	page, find := gmmu.pageTable.Find(req.PID, req.VAddr)
 	if find {
+		log.Printf("page %v's policy changed from %v to %v in gpu %v", page.VAddr, page.MigrationPolicy, req.NewPolicy, gmmu.Name())
 		page.MigrationPolicy = req.NewPolicy
 		gmmu.pageTable.Update(page)
 	}
@@ -340,6 +347,11 @@ func (gmmu *Comp) handleTranslationRsp(now sim.VTimeInSec, rsponse *vm.Translati
 	if _, ok := gmmu.pendingForcedMigrations[rsponse.Page.VAddr]; ok {
 		delete(gmmu.pendingForcedMigrations, rsponse.Page.VAddr)
 		gmmu.cachePage(rsponse.Page)
+		req := vm.NewUpdateDIDReq(now, gmmu.topPort, gmmu.l2TLBTopDst)
+		req.PID = rsponse.Page.PID
+		req.VAddr = rsponse.Page.VAddr
+		req.DeviceID = gmmu.deviceID
+		gmmu.pendingUpdateDIDReqs = append(gmmu.pendingUpdateDIDReqs, req)
 		return true
 	}
 
@@ -371,7 +383,6 @@ func (gmmu *Comp) handleTranslationRsp(now sim.VTimeInSec, rsponse *vm.Translati
 }
 
 func (gmmu *Comp) initCounter(vAddr uint64) {
-	log.Printf("initiated counter for page with vaddr %v\n", vAddr)
 	if gmmu.remainingAccesses == nil {
 		gmmu.remainingAccesses = make(map[uint64]int)
 	}
@@ -459,7 +470,7 @@ func (gmmu *Comp) updateCounter(now sim.VTimeInSec, req *vm.UpdateCounterReq) bo
 	remaining--
 	if remaining <= 0 {
 		delete(gmmu.remainingAccesses, vAddr)
-		log.Printf("req.vaddr=%v, forcing migration from %v to %v \n", req.VAddr, page.DeviceID, req.DeviceID)
+		log.Printf("[access-counter] req.vaddr=%v, forcing migration from %v to %v \n", req.VAddr, page.DeviceID, req.DeviceID)
 		// TODO: request remote
 		gmmu.requestForcedMigration(now, req.PID, req.VAddr, req.Write)
 
@@ -480,10 +491,43 @@ func (gmmu *Comp) requestForcedMigration(now sim.VTimeInSec, pid vm.PID, vAddr u
 		WithMigrate(true).
 		WithWrite(write).
 		Build()
-	gmmu.bottomPort.Send(req)
+	err := gmmu.bottomPort.Send(req)
+	if err != nil {
+		gmmu.pendingForcedMigrationReqs = append(gmmu.pendingForcedMigrationReqs, req)
+	}
 
 	if gmmu.pendingForcedMigrations == nil {
 		gmmu.pendingForcedMigrations = make(map[uint64]vm.PID)
 	}
 	gmmu.pendingForcedMigrations[vAddr] = pid
+}
+
+func (gmmu *Comp) handleForcedMigrations(now sim.VTimeInSec) bool {
+	if len(gmmu.pendingForcedMigrationReqs) == 0 {
+		return false
+	}
+
+	req := gmmu.pendingForcedMigrationReqs[0]
+	req.SendTime = now
+	err := gmmu.bottomPort.Send(req)
+	if err != nil {
+		return false
+	}
+
+	gmmu.pendingForcedMigrationReqs = gmmu.pendingForcedMigrationReqs[1:]
+	return true
+}
+
+func (gmmu *Comp) handleUpdateDIDReqs(now sim.VTimeInSec) bool {
+	if len(gmmu.pendingUpdateDIDReqs) == 0 {
+		return false
+	}
+	req := gmmu.pendingUpdateDIDReqs[0]
+	req.SendTime = now
+	e := gmmu.topPort.Send(req)
+	if e != nil {
+		return false
+	}
+	gmmu.pendingUpdateDIDReqs = gmmu.pendingUpdateDIDReqs[1:]
+	return true
 }
