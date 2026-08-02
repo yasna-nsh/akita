@@ -55,7 +55,8 @@ type MMU struct {
 	makePageROReqs     []*vm.MakePageReadOnlyReq
 	updatePolicyReqs   []*vm.UpdatePolicyReq
 
-	PageFaultCount []uint64
+	PageFaultCount      []uint64
+	TranslationReqCount []uint64
 }
 
 // Tick defines how the MMU update state each cycle
@@ -123,7 +124,7 @@ func (mmu *MMU) finalizePageWalk(
 }
 
 func (mmu *MMU) notifyPageFault(page vm.Page, req *vm.TranslationReq) {
-	mmu.PageFaultCount[req.DeviceID]++
+	mmu.PageFaultCount[req.DeviceID-1]++
 	log.Printf("[page fault counts per device] %v", mmu.PageFaultCount)
 	notif := vm.PageFaultNotificationBuilder{}.
 		WithSendTime(0). // set at actual send time below
@@ -539,6 +540,8 @@ func (mmu *MMU) parseFromTop(now sim.VTimeInSec) bool {
 
 	switch req := req.(type) {
 	case *vm.TranslationReq:
+		mmu.TranslationReqCount[req.DeviceID-1]++
+		log.Printf("[translation req counts per device] %v", mmu.TranslationReqCount)
 		mmu.startWalking(req)
 	default:
 		log.Panicf("MMU canot handle request of type %s", reflect.TypeOf(req))

@@ -102,6 +102,7 @@ func (b Builder) Build(name string) *MMU {
 	mmu.useOASIS = b.useOASIS
 	mmu.ROCopies = make(map[uint64][]uint64)
 	mmu.PageFaultCount = make([]uint64, 4)
+	mmu.TranslationReqCount = make([]uint64, 4)
 	return mmu
 }
 
