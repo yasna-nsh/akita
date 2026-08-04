@@ -48,9 +48,8 @@ type AddressTranslator struct {
 	currentGL0InvReq               *mem.GL0InvalidateReq
 	totalRequestsUponGL0InvArrival int
 
-	gmmuPort          sim.Port
-	gmmuPortDst       sim.Port
-	remainingAccesses map[uint64]int
+	gmmuPort    sim.Port
+	gmmuPortDst sim.Port
 }
 
 // SetTranslationProvider sets the remote port that can translate addresses.
@@ -221,17 +220,6 @@ func (t *AddressTranslator) parseTranslation(now sim.VTimeInSec) bool {
 	if transaction == nil {
 		t.translationPort.Retrieve(now)
 		return true
-	}
-
-	// start counting down if policy for page is access counter
-	// and haven't started count down before
-	page := transRsp.Page
-	if page.DeviceID != t.deviceID &&
-		page.MigrationPolicy == vm.PolicyAccessCounter {
-		_, exists := t.remainingAccesses[page.VAddr]
-		if !exists {
-			t.remainingAccesses[page.VAddr] = vm.MigrationThreshold
-		}
 	}
 
 	transaction.translationRsp = transRsp

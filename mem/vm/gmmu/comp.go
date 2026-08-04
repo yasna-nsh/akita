@@ -342,7 +342,7 @@ func (gmmu *Comp) fetchFromAT(now sim.VTimeInSec) bool {
 	return true
 }
 
-// TODO: update L1TLBs and L2TLB and caches if duplicate invalidation happens
+// update L1TLBs and L2TLB and caches if duplicate invalidation happens
 func (gmmu *Comp) handleTranslationRsp(now sim.VTimeInSec, rsponse *vm.TranslationRsp) bool {
 	if _, ok := gmmu.pendingForcedMigrations[rsponse.Page.VAddr]; ok {
 		delete(gmmu.pendingForcedMigrations, rsponse.Page.VAddr)

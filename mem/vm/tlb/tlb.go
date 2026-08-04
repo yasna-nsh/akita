@@ -457,8 +457,8 @@ func (tlb *TLB) sendtop(now sim.VTimeInSec) bool {
 		err := tlb.topPort.Send(req)
 		if err == nil {
 			progress = true
+			tlb.pendingInvalidates = tlb.pendingInvalidates[1:]
 		}
-		tlb.pendingInvalidates = tlb.pendingInvalidates[1:]
 	}
 	if len(tlb.pendingMakeReadOnly) != 0 {
 		req := tlb.pendingMakeReadOnly[0]
@@ -466,8 +466,8 @@ func (tlb *TLB) sendtop(now sim.VTimeInSec) bool {
 		err := tlb.topPort.Send(req)
 		if err == nil {
 			progress = true
+			tlb.pendingMakeReadOnly = tlb.pendingMakeReadOnly[1:]
 		}
-		tlb.pendingMakeReadOnly = tlb.pendingMakeReadOnly[1:]
 	}
 	if len(tlb.pendingUpdatePolicies) != 0 {
 		req := tlb.pendingUpdatePolicies[0]
@@ -475,8 +475,8 @@ func (tlb *TLB) sendtop(now sim.VTimeInSec) bool {
 		err := tlb.topPort.Send(req)
 		if err == nil {
 			progress = true
+			tlb.pendingUpdatePolicies = tlb.pendingUpdatePolicies[1:]
 		}
-		tlb.pendingUpdatePolicies = tlb.pendingUpdatePolicies[1:]
 	}
 	if len(tlb.pendingUpdateDIDs) != 0 {
 		req := tlb.pendingUpdateDIDs[0]
@@ -484,8 +484,8 @@ func (tlb *TLB) sendtop(now sim.VTimeInSec) bool {
 		err := tlb.topPort.Send(req)
 		if err == nil {
 			progress = true
+			tlb.pendingUpdateDIDs = tlb.pendingUpdateDIDs[1:]
 		}
-		tlb.pendingUpdateDIDs = tlb.pendingUpdateDIDs[1:]
 	}
 
 	return progress
